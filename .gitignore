@@ -1,4 +1,5 @@
 /target/
 /work/
-/outputs/*.exe
+/outputs/
 *.log
+.DS_Store
