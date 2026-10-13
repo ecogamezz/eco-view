@@ -2,22 +2,32 @@
 name = "eco-view"
 version = "0.1.0"
 edition = "2024"
-description = "An elegant, customizable Windows system monitor"
+description = "A customizable macOS system monitor"
 license = "MIT"
 
 [dependencies]
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 eframe = { version = "0.31.1", default-features = false, features = ["default_fonts", "glow"] }
 image = { version = "0.25.10", default-features = false, features = ["bmp", "ico", "jpeg", "png"] }
+libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sysinfo = "0.33.1"
+# No "multithread": its rayon pool cost far more than refreshing
+# processes on the metrics thread itself.
+sysinfo = { version = "0.33.1", default-features = false, features = ["component", "disk", "network", "system", "user"] }
 
-[target.'cfg(windows)'.dependencies]
-windows = { version = "0.58.0", features = ["Win32_Media_Audio", "Win32_Media_Audio_Endpoints", "Win32_System_Com", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Controls_Dialogs"] }
+# AppKit access for the raccoon's overlay window (Spaces, shadow, level) and the
+# Dock-aware visible frame of each display. Same versions winit already pulls in.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.5.2"
+objc2-foundation = { version = "0.2.2", features = ["NSArray", "NSEnumerator", "NSGeometry", "NSString"] }
+objc2-app-kit = { version = "0.2.2", features = ["NSApplication", "NSResponder", "NSRunningApplication", "NSScreen", "NSWindow", "NSWorkspace", "libc"] }
 
 [profile.release]
-opt-level = "z"
+# The dashboard, particles, and raccoon all animate every frame, so favour
+# frame rate over binary size on this Intel Mac.
+opt-level = 3
 lto = true
 codegen-units = 1
 strip = "symbols"
+panic = "abort"
