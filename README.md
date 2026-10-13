@@ -60,7 +60,7 @@ All monitoring happens locally. eco view does not upload telemetry. Network rate
 cargo test
 ```
 
-Covers the layout grid (overlap rejection, clamping, and the no-change detection that keeps settings from being rewritten on every frame of a drag) and the `pmset` battery parsing that the UI depends on.
+Covers the layout grid (overlap rejection, clamping, and the no-change detection that keeps settings from being rewritten on every frame of a drag), the `pmset` battery parsing that the UI depends on, and the click-through behaviour of the companion overlay.
 
 ## Project layout
 
@@ -75,3 +75,4 @@ Covers the layout grid (overlap rejection, clamping, and the no-change detection
 - `src/companion.rs` — floating toggle chip and 3D raccoon NPC.
 - `build.sh` — Intel macOS `.app` bundle build.
 - `tests/integration.rs` — layout grid and battery parsing regression tests.
+- `tests/hit_test.rs` — click-through regression test for the companion overlay.

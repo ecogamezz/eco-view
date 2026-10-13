@@ -185,7 +185,7 @@ impl Companion {
 
     pub fn tick_and_draw(
         &mut self,
-        ui: &egui::Ui,
+        ctx: &egui::Context,
         platforms: &[Rect],
         snap: &Snapshot,
         pal: Palette,
@@ -194,7 +194,7 @@ impl Companion {
         if !self.enabled {
             return;
         }
-        let screen = ui.ctx().screen_rect();
+        let screen = ctx.screen_rect();
         self.bounds = screen;
         let owned: Vec<Rect> = if platforms.is_empty() {
             vec![Rect::from_min_max(
@@ -207,7 +207,7 @@ impl Companion {
         self.time += dt;
         self.think(&owned, snap, dt);
         self.integrate(&owned, dt);
-        paint_raccoon(ui, self, pal);
+        paint_raccoon(ctx, self, pal);
     }
 
     fn think(&mut self, platforms: &[Rect], snap: &Snapshot, dt: f32) {
@@ -398,8 +398,8 @@ fn pick_platform_top(platforms: &[Rect], from: Pos2, seed: f32) -> Pos2 {
     Pos2::new(x, p.top())
 }
 
-fn paint_raccoon(ui: &egui::Ui, npc: &Companion, _pal: Palette) {
-    let painter = ui.ctx().layer_painter(egui::LayerId::new(
+fn paint_raccoon(ctx: &egui::Context, npc: &Companion, _pal: Palette) {
+    let painter = ctx.layer_painter(egui::LayerId::new(
         Order::Foreground,
         egui::Id::new("eco-raccoon-mesh"),
     ));

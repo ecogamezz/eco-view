@@ -234,6 +234,9 @@ impl eframe::App for EcoView {
             egui::Area::new(egui::Id::new("toast"))
                 .order(egui::Order::Foreground)
                 .anchor(egui::Align2::RIGHT_BOTTOM, [-18.0, -18.0])
+                // Purely informational: don't let it steal clicks from
+                // whatever card happens to sit underneath.
+                .interactable(false)
                 .show(ctx, |ui| {
                     egui::Frame::new()
                         .fill(pal.panel)
@@ -253,14 +256,13 @@ impl eframe::App for EcoView {
         if toggled || self.companion.chip_settled() {
             self.persist();
         }
-        egui::Area::new(egui::Id::new("raccoon-stage"))
-            .order(egui::Order::Foreground)
-            .fixed_pos(Pos2::ZERO)
-            .interactable(false)
-            .show(ctx, |ui| {
-                ui.set_min_size(ctx.screen_rect().size());
-                self.companion.tick_and_draw(ui, &self.platforms, &metrics.snap, pal, dt);
-            });
+        // Deliberately NOT an `egui::Area`: an Area registers a widget rect, and
+        // a full-screen one on Order::Foreground makes egui's hit test stop at
+        // this layer, swallowing every click aimed at the nav, cards or
+        // settings underneath. Painting straight to a foreground layer adds no
+        // widget, so the raccoon stays purely decorative.
+        self.companion
+            .tick_and_draw(ctx, &self.platforms, &metrics.snap, pal, dt);
 
         ctx.request_repaint_after(std::time::Duration::from_millis(16));
     }
