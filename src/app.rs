@@ -3,7 +3,8 @@ use std::time::Instant;
 
 use eframe::egui::{self, Color32, Pos2, Rect, Sense, Vec2};
 
-use crate::companion::Companion;
+use crate::companion::{Chip, Companion};
+use crate::overlay::{self, OverlayEvents, Shared};
 use crate::format;
 use crate::grid::{CardId, COLS};
 use crate::icons::{self, Icon};
@@ -33,7 +34,12 @@ pub struct EcoView {
     notify: NotifyTx,
     sound: SoundTx,
     ambient: Ambient,
-    companion: Companion,
+    /// Shared with the always-on-top overlay window.
+    npc: Shared,
+    chip: Chip,
+    overlay_live: bool,
+    overlay_events: OverlayEvents,
+    platforms_cached: Vec<Rect>,
     page: Page,
     last_frame: Instant,
     pulse: f32,
@@ -66,12 +72,18 @@ impl EcoView {
         if settings.autostart && !crate::autostart::is_enabled() {
             let _ = crate::autostart::set_enabled(true);
         }
-        let mut companion = Companion::new(settings.companion_enabled);
+        let mut npc = Companion::new(&settings.companion);
+        npc.enabled = settings.companion.enabled;
+        let mut chip = Chip::default();
         if let Some(pos) = settings.companion_chip_pos {
-            companion.set_chip_pos(pos);
+            chip.set_pos(pos);
         }
         Self {
-            companion,
+            npc: Arc::new(Mutex::new(npc)),
+            chip,
+            overlay_live: false,
+            overlay_events: OverlayEvents::default(),
+            platforms_cached: Vec::new(),
             settings,
             settings_shared,
             metrics,
@@ -96,8 +108,8 @@ impl EcoView {
     }
 
     fn persist(&mut self) {
-        self.settings.companion_enabled = self.companion.enabled;
-        self.settings.companion_chip_pos = self.companion.chip_pos();
+        self.settings.companion.enabled = self.npc.lock().map(|n| n.enabled).unwrap_or(false);
+        self.settings.companion_chip_pos = self.chip.pos();
         self.settings.save();
         if let Ok(mut g) = self.settings_shared.lock() {
             *g = self.settings.clone();
@@ -249,20 +261,19 @@ impl eframe::App for EcoView {
                 });
         }
 
-        let toggled = self.companion.paint_toggle(ctx, pal);
+        let enabled = self.npc.lock().map(|n| n.enabled).unwrap_or(false);
+        let toggled = self.chip.paint(ctx, enabled, pal.accent);
         if toggled {
             self.sound.play(Cue::Accent);
+            if let Ok(mut n) = self.npc.lock() {
+                n.enabled = !n.enabled;
+            }
         }
-        if toggled || self.companion.chip_settled() {
+        if toggled || self.chip.settled() {
             self.persist();
         }
-        // Deliberately NOT an `egui::Area`: an Area registers a widget rect, and
-        // a full-screen one on Order::Foreground makes egui's hit test stop at
-        // this layer, swallowing every click aimed at the nav, cards or
-        // settings underneath. Painting straight to a foreground layer adds no
-        // widget, so the raccoon stays purely decorative.
-        self.companion
-            .tick_and_draw(ctx, &self.platforms, &metrics.snap, pal, dt);
+
+        self.drive_overlay(ctx, &metrics, dt);
 
         ctx.request_repaint_after(std::time::Duration::from_millis(16));
     }
@@ -758,19 +769,221 @@ impl EcoView {
                 dirty = true;
             }
             ui.separator();
-            ui.label(
-                egui::RichText::new("The raccoon companion is a floating overlay. Use the circular chip — it is not part of the dashboard grid or page margins.")
-                    .small()
-                    .color(pal.muted),
-            );
-            if ui.checkbox(&mut self.companion.enabled, "Raccoon companion").changed() {
-                dirty = true;
-            }
+            dirty |= self.companion_settings(ui, pal);
             if dirty {
                 self.persist();
             }
             let _ = ctx;
         });
+    }
+
+    /// The whole companion panel. Returns true when anything changed.
+    fn companion_settings(&mut self, ui: &mut egui::Ui, pal: Palette) -> bool {
+        use crate::companion::{state_defs, State};
+        let mut dirty = false;
+        let c = &mut self.settings.companion;
+
+        ui.label(egui::RichText::new("Raccoon").heading());
+        ui.label(
+            egui::RichText::new(
+                "Click the chip on the dashboard to let him out. He floats above every other \
+                 app, so you can drag him anywhere and throw him.",
+            )
+            .small()
+            .color(pal.muted),
+        );
+        dirty |= ui.checkbox(&mut c.enabled, "Companion enabled").changed();
+
+        // ---- live state readout -------------------------------------------
+        if let Ok(mut npc) = self.npc.lock() {
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "now: {}",
+                        crate::companion::def_for(npc.state).label
+                    ))
+                    .small()
+                    .color(pal.accent),
+                );
+                ui.label(
+                    egui::RichText::new(format!(
+                        "state {:.1}s · {}",
+                        npc.state_t,
+                        if npc.on_ground { "grounded" } else { "airborne" }
+                    ))
+                    .small()
+                    .color(pal.muted),
+                );
+            });
+            ui.horizontal(|ui| {
+                if ui.button("Flip").clicked() {
+                    let t = npc.time;
+                    npc.enter(State::Flip, t);
+                }
+                if ui.button("Dance").clicked() {
+                    let t = npc.time;
+                    npc.enter(State::Dance, t);
+                }
+                if ui.button("Panic").clicked() {
+                    let t = npc.time;
+                    npc.enter(State::Panic, t);
+                }
+                if ui.button("Cheer").clicked() {
+                    let t = npc.time;
+                    npc.enter(State::Cheer, t);
+                }
+            });
+            ui.horizontal(|ui| {
+                if ui.button("Recentre on screen").clicked() {
+                    let r = npc.bounds;
+                    npc.pos = eframe::egui::Pos2::new(r.center().x, r.bottom() - 60.0);
+                    npc.vel = eframe::egui::Vec2::ZERO;
+                }
+                if ui.button("Toss him").clicked() {
+                    npc.vel = eframe::egui::Vec2::new(420.0, -520.0);
+                    npc.spin_vel = 1.4;
+                    let t = npc.time;
+                    npc.enter(State::Thrown, t);
+                }
+            });
+        }
+
+        // ---- presentation -------------------------------------------------
+        ui.add_space(6.0);
+        if section(ui, pal, "Presentation") {
+            dirty |= draggable(ui, &mut c.sprite_scale, 0.4..=5.0, "Sprite scale");
+            dirty |= draggable(ui, &mut c.animation_speed, 0.1..=6.0, "Animation speed");
+            dirty |= ui.checkbox(&mut c.show_shadow, "Ground shadow").changed();
+            dirty |= ui.checkbox(&mut c.show_name_tag, "Name tag").changed();
+            dirty |= ui.checkbox(&mut c.flip_sprite_with_facing, "Mirror when turning").changed();
+
+            ui.separator();
+            ui.label(egui::RichText::new("Colours").small().color(pal.muted));
+            fn pick(ui: &mut egui::Ui, v: &mut [u8; 3]) -> bool {
+                ui.color_edit_button_srgb(v).changed()
+            }
+            egui::Grid::new("raccoon_palette").num_columns(4).show(ui, |ui| {
+                let slots: [(&str, &mut [u8; 3]); 7] = [
+                    ("Fur", &mut c.fur),
+                    ("Dark", &mut c.fur_dark),
+                    ("Light", &mut c.fur_light),
+                    ("Cream", &mut c.cream),
+                    ("Mask", &mut c.mask),
+                    ("Iris", &mut c.iris),
+                    ("Outline", &mut c.outline),
+                ];
+                for (i, (label, slot)) in slots.into_iter().enumerate() {
+                    if i % 4 == 0 && i > 0 {
+                        ui.end_row();
+                    }
+                    ui.vertical(|ui| {
+                        ui.label(label);
+                        dirty |= pick(ui, slot);
+                    });
+                }
+            });
+        }
+
+        // ---- window -------------------------------------------------------
+        if section(ui, pal, "Window") {
+            dirty |= ui.checkbox(&mut c.always_on_top, "Float above all apps").changed();
+            dirty |= ui
+                .checkbox(&mut c.click_through, "Ignore mouse clicks (decorative)")
+                .changed();
+            dirty |= ui.checkbox(&mut c.follow_cursor, "Follow the cursor").changed();
+            ui.label(
+                egui::RichText::new(
+                    "His window is small and follows him, so clicks beside it still reach \
+                     whatever is underneath.",
+                )
+                .small()
+                .color(pal.muted),
+            );
+        }
+
+        // ---- movement -----------------------------------------------------
+        if section(ui, pal, "Movement") {
+            dirty |= draggable(ui, &mut c.walk_speed, 0.0..=600.0, "Walk speed");
+            dirty |= draggable(ui, &mut c.run_speed, 0.0..=1200.0, "Run speed");
+            dirty |= draggable(ui, &mut c.sprint_speed, 0.0..=1800.0, "Sprint speed");
+        }
+
+        // ---- physics ------------------------------------------------------
+        if section(ui, pal, "Physics") {
+            dirty |= draggable(ui, &mut c.gravity, 0.0..=4000.0, "Gravity");
+            dirty |= draggable(ui, &mut c.air_drag, 0.0..=8.0, "Air drag");
+            dirty |= draggable(ui, &mut c.restitution, 0.0..=1.0, "Bounciness");
+            dirty |= draggable(ui, &mut c.ground_friction, 0.0..=1.0, "Ground friction");
+            dirty |= draggable(ui, &mut c.wall_restitution, 0.0..=1.0, "Wall bounce");
+            dirty |= draggable(ui, &mut c.throw_power, 0.0..=5.0, "Throw power");
+            dirty |= draggable(ui, &mut c.toss_strength, 0.0..=1200.0, "Gentle toss");
+            dirty |= draggable(ui, &mut c.spin_per_speed, 0.0..=0.02, "Spin per speed");
+            dirty |= draggable(ui, &mut c.hard_impact_speed, 50.0..=2000.0, "Hard landing");
+            dirty |= ui.checkbox(&mut c.throw_dizzy, "Get dizzy after a bad throw").changed();
+        }
+
+        // ---- reactions ----------------------------------------------------
+        if section(ui, pal, "Reactions") {
+            dirty |= draggable(ui, &mut c.sleep_below_cpu, 0.0..=60.0, "Sleep below CPU %");
+            dirty |= draggable(ui, &mut c.sleep_below_gpu, 0.0..=100.0, "Sleep below GPU %");
+            dirty |= draggable(ui, &mut c.panic_above_cpu, 0.0..=100.0, "Panic above CPU %");
+            dirty |= draggable(ui, &mut c.panic_above_gpu, 0.0..=100.0, "Panic above GPU %");
+            ui.horizontal_wrapped(|ui| {
+                dirty |= ui.checkbox(&mut c.react_to_cpu, "CPU").changed();
+                dirty |= ui.checkbox(&mut c.react_to_gpu, "GPU").changed();
+                dirty |= ui.checkbox(&mut c.react_to_memory, "Memory").changed();
+                dirty |= ui.checkbox(&mut c.react_to_battery, "Battery").changed();
+                dirty |= ui.checkbox(&mut c.react_to_network, "Network").changed();
+            });
+        }
+
+        // ---- timing -------------------------------------------------------
+        if section(ui, pal, "Timing") {
+            dirty |= draggable(ui, &mut c.state_time_scale, 0.1..=5.0, "Global time scale");
+            dirty |= draggable(ui, &mut c.idle_boredom, 0.0..=4.0, "Boredom");
+        }
+
+        // ---- per-state ----------------------------------------------------
+        if section(ui, pal, "Per-state tuning") {
+            ui.label(
+                egui::RichText::new("How long he lasts, how often he picks it, and how long he waits.")
+                    .small()
+                    .color(pal.muted),
+            );
+            for d in state_defs() {
+                let key = d.label.to_string();
+                let mut tune = c.states.get(&key).copied().unwrap_or_default();
+                egui::Grid::new(("st", d.state as u32)).num_columns(4).show(ui, |ui| {
+                    ui.label(d.label);
+                    let r = ui.add(
+                        egui::Slider::new(&mut tune.duration_mul, 0.05..=6.0)
+                            .suffix("x time")
+                            .text(""),
+                    );
+                    let r2 = ui.add(
+                        egui::Slider::new(&mut tune.weight_mul, 0.0..=20.0)
+                            .suffix("x chance")
+                            .text(""),
+                    );
+                    let r3 = ui.add(
+                        egui::Slider::new(&mut tune.cooldown_mul, 0.0..=8.0)
+                            .suffix("x wait")
+                            .text(""),
+                    );
+                    ui.end_row();
+                    if r.changed() || r2.changed() || r3.changed() {
+                        c.states.insert(key.clone(), tune);
+                        dirty = true;
+                    }
+                });
+            }
+        }
+
+        if ui.button("Reset companion settings").clicked() {
+            self.settings.companion = Default::default();
+            dirty = true;
+        }
+        dirty
     }
 
     fn check_warnings(&mut self, metrics: &Metrics) {
@@ -863,4 +1076,121 @@ fn apply_icon(cc: &eframe::CreationContext<'_>, settings: &Settings) {
     };
     cc.egui_ctx
         .send_viewport_cmd(egui::ViewportCommand::Icon(Some(std::sync::Arc::new(icon))));
+}
+
+impl EcoView {
+    /// Advances the raccoon and keeps its always-on-top window in place.
+    ///
+    /// The NPC lives in *global screen coordinates* so it can be dragged and
+    /// thrown anywhere on the desktop. The dashboard's card rects are in
+    /// window-local coordinates, so they are shifted by this window's screen
+    /// position to become platforms it can stand on.
+    fn drive_overlay(&mut self, ctx: &eframe::egui::Context, metrics: &Metrics, dt: f32) {
+        let enabled = self.settings.companion.enabled;
+
+        if !enabled {
+            // Nothing to draw. Tear the window down once and get out of the
+            // way, rather than doing per-frame bookkeeping for an overlay
+            // that is not there.
+            if self.overlay_live {
+                self.overlay_live = false;
+                overlay::close(ctx);
+            }
+            if let Ok(mut npc) = self.npc.lock() {
+                npc.enabled = false;
+            }
+            return;
+        }
+
+        // This window's own offset within the desktop.
+        let screen_rect = ctx.input(|i| i.screen_rect());
+        let screen_origin = screen_rect.min.to_vec2();
+
+        // Dashboard cards become walkable platforms. They are in window-local
+        // coordinates, so shift them into global screen space.
+        if self.platforms_changed() {
+            let platforms: Vec<Rect> = self
+                .platforms
+                .iter()
+                .map(|r| r.translate(screen_origin))
+                .collect();
+            if let Ok(mut npc) = self.npc.lock() {
+                npc.platforms = platforms;
+            }
+        }
+
+        let cfg = self.settings.companion.clone();
+        if let Ok(mut npc) = self.npc.lock() {
+            npc.enabled = true;
+            npc.scale = cfg.sprite_scale;
+            npc.bounds = screen_rect;
+            // Always give him the bottom of the display to stand on. Without
+            // it, pages with no cards leave him with nothing to land on, so he
+            // could never come to rest or walk anywhere.
+            npc.floor = Some(screen_rect.bottom());
+            // Place him on the first run, otherwise he starts at the origin.
+            if !npc.placed {
+                npc.placed = true;
+                npc.pos = Pos2::new(screen_rect.center().x, screen_rect.bottom() - 40.0);
+            }
+            npc.apply_view(&cfg);
+            npc.repaint(&cfg);
+            npc.tick(&metrics.snap, &cfg, dt);
+        }
+
+        self.overlay_live = true;
+        let npc = self.npc.clone();
+        let events = &mut self.overlay_events;
+        ctx.show_viewport_immediate(
+            overlay::viewport_id(),
+            overlay::builder(),
+            move |vctx, _class| {
+                overlay::ui(vctx, &npc, events);
+                overlay::sync(vctx, &npc);
+            },
+        );
+        if self.overlay_events.grabbed {
+            self.overlay_events.grabbed = false;
+            self.sound.play(Cue::Click);
+        }
+        if self.overlay_events.released {
+            self.overlay_events.released = false;
+            if self.overlay_events.throw.length() > 300.0 {
+                self.sound.play(Cue::Accent);
+            }
+        }
+    }
+
+    /// Cheap check so the platform Vec is only rebuilt when cards actually move.
+    fn platforms_changed(&mut self) -> bool {
+        if self.platforms != self.platforms_cached {
+            self.platforms_cached = self.platforms.clone();
+            return true;
+        }
+        false
+    }
+}
+
+
+/// A collapsible sub-panel header. Returns true while open.
+fn section(ui: &mut egui::Ui, pal: Palette, title: &str) -> bool {
+    ui.collapsing(egui::RichText::new(title).strong().color(pal.accent), |ui| {
+        ui.add_space(4.0);
+    })
+    .body_response
+    .is_some()
+}
+
+/// A labelled slider that marks the settings dirty when dragged.
+fn draggable(
+    ui: &mut egui::Ui,
+    value: &mut f32,
+    range: std::ops::RangeInclusive<f32>,
+    label: &str,
+) -> bool {
+    let r = ui.horizontal(|ui| {
+        ui.label(label);
+        ui.add(egui::Slider::new(value, range).text(""))
+    });
+    r.inner.changed()
 }

@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::companion_settings::CompanionSettings;
 use crate::grid::{CardId, GridLayout};
 use crate::particles::ParticleStyle;
 
@@ -47,6 +48,8 @@ pub struct Settings {
     /// Where the user last dragged the floating companion chip, in window coords.
     /// Kept out of the grid so it can never push cards around.
     pub companion_chip_pos: Option<[f32; 2]>,
+    /// Everything tunable about the raccoon.
+    pub companion: CompanionSettings,
 }
 
 impl Default for Settings {
@@ -82,6 +85,7 @@ impl Default for Settings {
             net_heatmap: false,
             companion_enabled: false,
             companion_chip_pos: None,
+            companion: CompanionSettings::default(),
         }
     }
 }
@@ -129,6 +133,7 @@ impl Settings {
                 if pos[1].is_finite() { pos[1] } else { 72.0 },
             ]);
         }
+        self.companion.sanitize();
         self.layout.sanitize();
     }
 

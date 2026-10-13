@@ -24,13 +24,31 @@
 
 ## Raccoon companion
 
-A small circular chip floats above the UI. It is its own overlay: it does not participate in the dashboard grid, navigation layout, or page margins, and you can drag it anywhere. Its resting spot is saved, so it comes back where you left it.
+A small circular chip on the dashboard toggles him. The chip is a foreground `egui::Area` that lives entirely outside the grid and page margins, so it can never displace a card.
 
-Click the chip to toggle a 3D low-poly raccoon NPC. It walks the dashboard, looks around, jumps onto metric cards, sleeps when the machine is idle, panics when load spikes, and cheers when load drops. The companion is drawn on a foreground layer so it cannot shove other widgets around.
+Click it and he leaves the app: he is drawn in a **separate always-on-top, transparent window** that floats above every other application. That window is deliberately small and follows him rather than covering the screen, which is what keeps the rest of the desktop usable — clicks that miss it fall through to whatever is underneath, so there are no click-through regions to tune.
 
-The raccoon is real 3D geometry, not a sprite: it is assembled from ellipsoids and triangles at runtime, then back-face culled, depth-sorted, Lambert-shaded, and perspective-projected each frame, with the head turning on a yaw/pitch rig and the limbs swinging off a walk phase.
+You can pick him up and throw him anywhere. Dragging carries his body, and releasing hands him the pointer's velocity, so he flies, spins, bounces off the floor and the sides of the screen, and lands hard enough to go dizzy.
 
-Its reactions: idle glancing, wandering between cards, jumping onto them, sleeping when the machine is idle, an alert dash with a `!` when load spikes, and a cheer hop when load drops. The mood decay is frame-rate independent, so a 120Hz display behaves the same as 60Hz.
+### Sprite sheets
+
+There is no 3D mesh. He is a pixel-art sprite sheet, generated once at startup into a single atlas texture with one cell per animation frame — 263 frames across 34 clips. Each frame is described by a small pose vector (limb phases, body bob, squash and stretch, head turn, ear perk, tail wag, expression), so the whole animation set is data rather than drawn art. Playing a clip is picking a UV rect out of the atlas.
+
+Clips: idle, look around, peek, sleep, wake, walk, run, sprint, jump rise, jump fall, land, flip, climb, sit, stretch, groom, scratch, wave, dance, salute, shrug, point, sneeze, eat, play, idle talk, hide, alert, panic, cheer, dragged, tumble, bounce, dizzy, trip.
+
+### The state machine
+
+States behave like a boss's moveset. Each one has a duration, a priority, an interrupt rule and a cooldown, defined in one table in `src/companion.rs`:
+
+- **Reactions** (sleep, wake, alert, panic, cheer) are driven by the machine's load and out-rank whatever idle behaviour is playing.
+- **Idle behaviours** are picked by weight once nothing is forcing the issue.
+- **Cooldowns** stop the same move firing repeatedly, and weighted picks mean one behaviour cannot dominate.
+
+There are 37 states in total, and he can be picked up, carried, thrown and bounced regardless of which one is running.
+
+### Settings
+
+Everything is tunable from Settings, grouped into Presentation, Window, Movement, Physics, Reactions, Timing, and a **Per-state tuning** table with a duration, weight and cooldown multiplier for each of the 37 states individually. You can also recolour him, change sprite scale and animation speed, and there are buttons to force any state and to toss him across the screen.
 
 ## Build on Intel macOS
 
@@ -72,7 +90,10 @@ Covers the layout grid (overlap rejection, clamping, and the no-change detection
 - `src/autostart.rs` — per-user LaunchAgent login item.
 - `src/discord.rs` — Discord Rich Presence UNIX IPC worker.
 - `src/notifications.rs` and `src/sound.rs` — macOS notification and system-sound workers.
-- `src/companion.rs` — floating toggle chip and 3D raccoon NPC.
+- `src/companion.rs` — sprite-driven NPC: state machine and rigid body.
+- `src/sprite.rs` — procedural pixel-art sprite sheet generator and atlas.
+- `src/companion_settings.rs` — every tunable value for the companion.
+- `src/overlay.rs` — the always-on-top window that floats over other apps.
 - `build.sh` — Intel macOS `.app` bundle build.
 - `tests/integration.rs` — layout grid and battery parsing regression tests.
 - `tests/hit_test.rs` — click-through regression test for the companion overlay.
