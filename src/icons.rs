@@ -127,21 +127,6 @@ pub fn paint(painter: &egui::Painter, origin: Pos2, size: f32, kind: Icon, color
             ];
             painter.add(egui::Shape::line(pts.to_vec(), st));
         }
-        Icon::Raccoon => {
-            painter.circle_filled(Pos2::new(x + s * 0.5, y + s * 0.55), s * 0.28, Color32::from_rgb(92, 74, 62));
-            painter.circle_filled(Pos2::new(x + s * 0.32, y + s * 0.28), s * 0.1, Color32::from_rgb(58, 46, 40));
-            painter.circle_filled(Pos2::new(x + s * 0.68, y + s * 0.28), s * 0.1, Color32::from_rgb(58, 46, 40));
-            painter.rect_filled(
-                egui::Rect::from_center_size(Pos2::new(x + s * 0.5, y + s * 0.52), egui::vec2(s * 0.5, s * 0.16)),
-                8.0,
-                Color32::from_rgb(20, 18, 16),
-            );
-            painter.circle_filled(Pos2::new(x + s * 0.4, y + s * 0.52), s * 0.055, Color32::from_rgb(240, 236, 220));
-            painter.circle_filled(Pos2::new(x + s * 0.6, y + s * 0.52), s * 0.055, Color32::from_rgb(240, 236, 220));
-            painter.circle_filled(Pos2::new(x + s * 0.4, y + s * 0.52), s * 0.028, Color32::from_rgb(40, 28, 16));
-            painter.circle_filled(Pos2::new(x + s * 0.6, y + s * 0.52), s * 0.028, Color32::from_rgb(40, 28, 16));
-            painter.circle_filled(Pos2::new(x + s * 0.5, y + s * 0.62), s * 0.035, Color32::from_rgb(24, 18, 16));
-        }
     }
 }
 
@@ -162,7 +147,6 @@ pub enum Icon {
     Settings,
     Overview,
     Perf,
-    Raccoon,
 }
 
 impl Icon {

@@ -1,8 +1,6 @@
 mod app;
 mod audio;
 mod autostart;
-mod companion;
-mod companion_settings;
 mod devices;
 mod discord;
 mod format;
@@ -11,19 +9,36 @@ mod grid;
 mod icons;
 mod metrics;
 mod notifications;
-mod overlay;
 mod particles;
+mod raccoon;
 mod settings;
 mod sound;
-mod sprite;
 mod theme;
 mod ui;
 
 use eframe::egui::{IconData, ViewportBuilder};
 
 fn main() -> eframe::Result<()> {
+    // Developer aid: render every raccoon activity to a PNG and exit.
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(i) = args.iter().position(|a| a == "--raccoon-sheet") {
+        let out = args.get(i + 1).cloned().unwrap_or_else(|| "raccoon-sheet.png".into());
+        let cfg = settings::Settings::load().companion;
+        if let Err(e) = raccoon::preview::sheet(std::path::Path::new(&out), &cfg) {
+            eprintln!("could not write {out}: {e}");
+            std::process::exit(1);
+        }
+        println!("wrote {out}");
+        return Ok(());
+    }
+
     let icon = default_icon();
     let mut viewport = ViewportBuilder::default()
+        // The raccoon's overlay shares this window's OpenGL configuration,
+        // and eframe only picks a pixel format with an alpha channel when the
+        // *root* window asks for transparency. The dashboard still paints an
+        // opaque background everywhere.
+        .with_transparent(true)
         .with_inner_size([1280.0, 820.0])
         .with_min_inner_size([960.0, 640.0])
         .with_title("eco view")

@@ -14,6 +14,13 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sysinfo = "0.33.1"
 
+# AppKit access for the raccoon's overlay window (Spaces, shadow, level) and the
+# Dock-aware visible frame of each display. Same versions winit already pulls in.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.5.2"
+objc2-foundation = { version = "0.2.2", features = ["NSArray", "NSEnumerator", "NSGeometry", "NSString"] }
+objc2-app-kit = { version = "0.2.2", features = ["NSApplication", "NSResponder", "NSRunningApplication", "NSScreen", "NSWindow", "NSWorkspace", "libc"] }
+
 [profile.release]
 # The dashboard, particles, and raccoon all animate every frame, so favour
 # frame rate over binary size on this Intel Mac.

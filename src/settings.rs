@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::companion_settings::CompanionSettings;
+use crate::raccoon::RaccoonSettings;
 use crate::grid::{CardId, GridLayout};
 use crate::particles::ParticleStyle;
 
@@ -49,7 +49,7 @@ pub struct Settings {
     /// Kept out of the grid so it can never push cards around.
     pub companion_chip_pos: Option<[f32; 2]>,
     /// Everything tunable about the raccoon.
-    pub companion: CompanionSettings,
+    pub companion: RaccoonSettings,
 }
 
 impl Default for Settings {
@@ -85,7 +85,7 @@ impl Default for Settings {
             net_heatmap: false,
             companion_enabled: false,
             companion_chip_pos: None,
-            companion: CompanionSettings::default(),
+            companion: RaccoonSettings::default(),
         }
     }
 }

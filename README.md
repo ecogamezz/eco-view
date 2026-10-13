@@ -24,31 +24,59 @@
 
 ## Raccoon companion
 
-A small circular chip on the dashboard toggles him. The chip is a foreground `egui::Area` that lives entirely outside the grid and page margins, so it can never displace a card.
+Click the round chip on the dashboard to let him out (right-click it to call him over to the dashboard). He lives on top of your whole desktop, not inside the app.
 
-Click it and he leaves the app: he is drawn in a **separate always-on-top, transparent window** that floats above every other application. That window is deliberately small and follows him rather than covering the screen, which is what keeps the rest of the desktop usable — clicks that miss it fall through to whatever is underneath, so there are no click-through regions to tune.
+### How he lives on the desktop
 
-You can pick him up and throw him anywhere. Dragging carries his body, and releasing hands him the pointer's velocity, so he flies, spins, bounces off the floor and the sides of the screen, and lands hard enough to go dizzy.
+- **A real transparent overlay.** He's drawn in a borderless, always-on-top window that covers the display, joins every Space and sits over full-screen apps. The window is fully transparent, and it passes clicks through everywhere except where he actually is. The global cursor is polled from CoreGraphics every frame, so the overlay only catches the mouse while the cursor is over him or he's being carried. After you let go, focus goes back to the app you were using.
+- **He walks on your windows.** Other apps' window rectangles come from `CGWindowListCopyWindowInfo` (bounds only, so no Screen Recording permission is needed). Their title-bar edges become one-way platforms, with the parts covered by a window in front cut out. The dashboard's cards are platforms too. If you drag a window he's standing on, he rides along. If you close it, he falls.
+- **He gets around.** He walks, runs, jumps between windows on a solved ballistic arc, climbs the sides of tall windows and hauls himself over the top, and steps off edges to drop down. The floor is the top of the Dock and the ceiling is the menu bar.
+- **His own render loop.** The overlay is a deferred egui viewport, so he keeps moving while the dashboard is minimised. He drops to 20 fps when he's asleep and nothing is happening.
 
-### Sprite sheets
+### Art and animation
 
-There is no 3D mesh. He is a pixel-art sprite sheet, generated once at startup into a single atlas texture with one cell per animation frame — 263 frames across 34 clips. Each frame is described by a small pose vector (limb phases, body bob, squash and stretch, head turn, ear perk, tail wag, expression), so the whole animation set is data rather than drawn art. Playing a clip is picking a UV rect out of the atlas.
+He's drawn as anti-aliased vector shapes tessellated straight into an egui mesh, with no sprite sheet, so he stays sharp at any size and on Retina. Shapes in a group draw their outlines first and then their fills, which gives a clean cartoon silhouette. Fills have soft gradients.
 
-Clips: idle, look around, peek, sleep, wake, walk, run, sprint, jump rise, jump fall, land, flip, climb, sit, stretch, groom, scratch, wave, dance, salute, shrug, point, sneeze, eat, play, idle talk, hide, alert, panic, cheer, dragged, tumble, bounce, dizzy, trip.
+Animation is procedural:
 
-### The state machine
+- A pose per activity is blended smoothly into the next.
+- A skeleton is built from the pose: hips, a spine that can rear up, a head, four two-bone IK legs and a seven-segment ringed tail.
+- The gait phase is driven by the distance he actually covers, so his feet don't slide.
+- Secondary motion includes squash and stretch, a tail that lags behind movement, breathing, blinking, ear twitches, a smooth turn-around and eyes that follow the cursor.
+- When you carry him, he hangs from the cursor like a pendulum: he swings when you move, his legs dangle and his tail sags.
 
-States behave like a boss's moveset. Each one has a duration, a priority, an interrupt rule and a cooldown, defined in one table in `src/companion.rs`:
+There are six coats (Classic, Silver, Ginger, Midnight, Snow, Neon) plus a custom one.
 
-- **Reactions** (sleep, wake, alert, panic, cheer) are driven by the machine's load and out-rank whatever idle behaviour is playing.
-- **Idle behaviours** are picked by weight once nothing is forcing the issue.
-- **Cooldowns** stop the same move firing repeatedly, and weighted picks mean one behaviour cannot dominate.
+### What he does
 
-There are 37 states in total, and he can be picked up, carried, thrown and bounced regardless of which one is running.
+There are 50 activities, defined in one boss-style table in `src/raccoon/acts.rs` (duration range, cooldown, weight, priority, interrupt rule):
+
+- **Idle:** idle, look around, sit, loaf, sleep, yawn, stretch, groom, wash paws, scratch, sniff, rummage, snack, wave, dance, chase his tail, roll over, sneeze, hop, backflip.
+- **Getting around:** wander, run, explore, jump, climb, mantle, fall, land.
+- **With you:** curious (tilts his head at the cursor), follow the cursor, chase the cursor, stalk and pounce.
+- **Reactions to the Mac:** alert, then panic on a CPU or GPU spike. Overheating (fans himself with a leaf) on sustained load or high temperature. Cheering when the load drops or the charger is plugged in. Low battery. Memory full. Watching a big download.
+- **Reactions to you:** petted (rub the cursor back and forth over him), booped (click), annoyed (too many clicks), carried, thrown, bounce, splat (thrown hard into a screen edge), dizzy, get up.
+
+Needs (energy, boredom, affection) shift which activities he picks: he gets sleepy when tired or late at night and playful when bored. Speech bubbles comment on what's happening ("CPU at 97%!", "Battery at 12%... sleepy."), and particles add dust, hearts, stars, sweat, confetti, music notes, crumbs and Zzz. Optional sounds use macOS system sounds, including Purr.
 
 ### Settings
 
-Everything is tunable from Settings, grouped into Presentation, Window, Movement, Physics, Reactions, Timing, and a **Per-state tuning** table with a duration, weight and cooldown multiplier for each of the 37 states individually. You can also recolour him, change sprite scale and animation speed, and there are buttons to force any state and to toss him across the screen.
+Under Settings → Raccoon companion:
+
+- **Status:** a live readout with energy, boredom and affection meters, plus buttons to call him over, toss him, nap, wake, or force any activity.
+- **Appearance:** size, animation speed, outline, coat or custom colours, shadow, name tag, effects, speech bubbles and chattiness.
+- **Behaviour:** liveliness, walking on windows and cards, climbing, following and playing with the cursor, petting, decorative click-through mode, and nap rules.
+- **Reactions:** thresholds for each machine reaction.
+- **Movement and Physics:** every speed, gravity, bounce, throw and dangle constant.
+- **Sound.**
+- **Per-activity tuning:** length, chance and cooldown for each of the 50 activities.
+
+### Developer preview
+
+```zsh
+cargo run -- --raccoon-sheet sheet.png                       # every activity on one PNG
+RACCOON_SHEET_ONLY=0,14,38 cargo run -- --raccoon-sheet a.png  # just a few
+```
 
 ## Build on Intel macOS
 
