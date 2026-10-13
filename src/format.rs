@@ -33,3 +33,12 @@ pub fn uptime(secs: u64) -> String {
         format!("{hours}h {mins}m")
     }
 }
+
+/// "Mon 14 Oct, 09:12" from a Unix timestamp.
+pub fn boot_time(epoch: u64) -> String {
+    use chrono::TimeZone;
+    match chrono::Local.timestamp_opt(epoch as i64, 0).single() {
+        Some(t) if epoch > 0 => t.format("%a %-d %b, %H:%M").to_string(),
+        _ => "—".into(),
+    }
+}

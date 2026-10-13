@@ -12,7 +12,9 @@ image = { version = "0.25.10", default-features = false, features = ["bmp", "ico
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sysinfo = "0.33.1"
+# No "multithread": its rayon pool cost far more than refreshing
+# processes on the metrics thread itself.
+sysinfo = { version = "0.33.1", default-features = false, features = ["component", "disk", "network", "system", "user"] }
 
 # AppKit access for the raccoon's overlay window (Spaces, shadow, level) and the
 # Dock-aware visible frame of each display. Same versions winit already pulls in.

@@ -7,16 +7,28 @@ use crate::raccoon::RaccoonSettings;
 use crate::grid::{CardId, GridLayout};
 use crate::particles::ParticleStyle;
 
-#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Theme presets. Older settings files said "Dark" / "Light".
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum ThemeKind {
-    Dark,
-    Light,
+    #[serde(alias = "Dark")]
+    Midnight,
+    Graphite,
+    Aurora,
+    Ember,
+    #[serde(alias = "Light")]
+    Daylight,
+    Paper,
 }
+
+/// Version of the dashboard grid's default arrangement.
+pub const LAYOUT_VERSION: u32 = 2;
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     pub theme: ThemeKind,
+    /// Use `accent` / `accent_alt` instead of the theme's own accent.
+    pub custom_accent: bool,
     pub accent: [u8; 3],
     pub accent_alt: [u8; 3],
     pub surface: [u8; 3],
@@ -45,6 +57,20 @@ pub struct Settings {
     pub cpu_heatmap: bool,
     pub net_heatmap: bool,
     pub companion_enabled: bool,
+    /// Tighter spacing everywhere.
+    pub compact: bool,
+    /// Bumped when the default dashboard changes shape; older layouts are reset once.
+    #[serde(default)]
+    pub layout_version: u32,
+    pub sidebar_collapsed: bool,
+    /// Skip page transitions and animated numbers.
+    pub reduce_motion: bool,
+    /// Time window of the Performance charts, in seconds.
+    pub chart_window_secs: u32,
+    /// Post macOS notifications for alerts (the in-app alert centre always logs them).
+    pub native_alerts: bool,
+    /// Minimum seconds between two alerts.
+    pub alert_cooldown_secs: u32,
     /// Where the user last dragged the floating companion chip, in window coords.
     /// Kept out of the grid so it can never push cards around.
     pub companion_chip_pos: Option<[f32; 2]>,
@@ -55,7 +81,8 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            theme: ThemeKind::Dark,
+            theme: ThemeKind::Midnight,
+            custom_accent: false,
             accent: [0x3D, 0xFF, 0xC8],
             accent_alt: [0xFF, 0x4D, 0xC8],
             surface: [0x12, 0x16, 0x22],
@@ -65,8 +92,8 @@ impl Default for Settings {
             warn_ram: 90.0,
             warn_gpu: 90.0,
             warn_temp: 95.0,
-            particles: ParticleStyle::ArcadeSparks,
-            particle_intensity: 0.65,
+            particles: ParticleStyle::AuroraWaves,
+            particle_intensity: 0.35,
             show_toasts: true,
             show_banner: true,
             sound_volume: 0.4,
@@ -84,6 +111,13 @@ impl Default for Settings {
             cpu_heatmap: true,
             net_heatmap: false,
             companion_enabled: false,
+            compact: false,
+            layout_version: LAYOUT_VERSION,
+            sidebar_collapsed: false,
+            reduce_motion: false,
+            chart_window_secs: 300,
+            native_alerts: true,
+            alert_cooldown_secs: 60,
             companion_chip_pos: None,
             companion: RaccoonSettings::default(),
         }
@@ -127,6 +161,8 @@ impl Settings {
         self.warn_ram = self.warn_ram.clamp(1.0, 100.0);
         self.warn_gpu = self.warn_gpu.clamp(1.0, 100.0);
         self.warn_temp = self.warn_temp.clamp(1.0, 150.0);
+        self.chart_window_secs = self.chart_window_secs.clamp(30, 900);
+        self.alert_cooldown_secs = self.alert_cooldown_secs.clamp(5, 3600);
         if let Some(pos) = self.companion_chip_pos {
             self.companion_chip_pos = Some([
                 if pos[0].is_finite() { pos[0] } else { 24.0 },
@@ -134,6 +170,10 @@ impl Settings {
             ]);
         }
         self.companion.sanitize();
+        if self.layout_version < LAYOUT_VERSION {
+            self.layout = GridLayout::default_dashboard();
+            self.layout_version = LAYOUT_VERSION;
+        }
         self.layout.sanitize();
     }
 
@@ -152,10 +192,56 @@ impl Settings {
         }
     }
 
+    /// Validates the image and keeps a private copy next to the settings, so
+    /// later launches never have to reach into Downloads or Desktop.
     pub fn set_icon_from_file(&mut self, path: &Path) -> Result<(), String> {
         let bytes = fs::read(path).map_err(|e| e.to_string())?;
-        image::load_from_memory(&bytes).map_err(|e| e.to_string())?;
-        self.custom_icon = Some(path.to_path_buf());
+        let img = image::load_from_memory(&bytes).map_err(|e| e.to_string())?;
+        let dest = Self::path().with_file_name("icon.png");
+        if let Some(dir) = dest.parent() {
+            let _ = fs::create_dir_all(dir);
+        }
+        match img.save(&dest) {
+            Ok(()) => self.custom_icon = Some(dest),
+            Err(_) => self.custom_icon = Some(path.to_path_buf()),
+        }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_theme_names_still_load() {
+        let s: Settings = serde_json::from_str(r#"{"theme":"Light"}"#).unwrap();
+        assert_eq!(s.theme, ThemeKind::Daylight);
+        let s: Settings = serde_json::from_str(r#"{"theme":"Dark"}"#).unwrap();
+        assert_eq!(s.theme, ThemeKind::Midnight);
+    }
+
+    #[test]
+    fn layouts_from_older_builds_are_reset_once() {
+        let mut s: Settings = serde_json::from_str(r#"{"layout":{"items":[{"id":"Cpu","col":3,"row":3,"w":8,"h":4}]}}"#).unwrap();
+        assert_eq!(s.layout_version, 0);
+        s.sanitize();
+        assert_eq!(s.layout_version, LAYOUT_VERSION);
+        assert_eq!(s.layout.items.len(), GridLayout::default_dashboard().items.len());
+        // Once migrated, the user's own edits survive.
+        s.layout.items.retain(|i| i.id != CardId::Devices);
+        s.sanitize();
+        assert!(!s.layout.items.iter().any(|i| i.id == CardId::Devices));
+    }
+
+    #[test]
+    fn default_layout_has_no_overlaps() {
+        let l = GridLayout::default_dashboard();
+        for a in &l.items {
+            for b in &l.items {
+                assert!(!a.overlaps(b), "{:?} overlaps {:?}", a.id, b.id);
+            }
+            assert!(a.col + a.w <= crate::grid::COLS);
+        }
     }
 }

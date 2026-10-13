@@ -99,18 +99,18 @@ impl GridLayout {
     pub fn default_dashboard() -> Self {
         Self {
             items: vec![
-                GridItem { id: CardId::Cpu, col: 0, row: 0, w: 16, h: 8 },
-                GridItem { id: CardId::Memory, col: 16, row: 0, w: 16, h: 8 },
-                GridItem { id: CardId::Gpu, col: 32, row: 0, w: 16, h: 8 },
-                GridItem { id: CardId::Network, col: 0, row: 8, w: 16, h: 7 },
-                GridItem { id: CardId::Storage, col: 16, row: 8, w: 16, h: 7 },
-                GridItem { id: CardId::Battery, col: 32, row: 8, w: 8, h: 7 },
-                GridItem { id: CardId::Audio, col: 40, row: 8, w: 8, h: 7 },
-                GridItem { id: CardId::Thermal, col: 0, row: 15, w: 12, h: 6 },
-                GridItem { id: CardId::Uptime, col: 12, row: 15, w: 12, h: 6 },
-                GridItem { id: CardId::System, col: 24, row: 15, w: 24, h: 6 },
-                GridItem { id: CardId::Processes, col: 0, row: 21, w: 30, h: 10 },
-                GridItem { id: CardId::Devices, col: 30, row: 21, w: 18, h: 10 },
+                GridItem { id: CardId::Cpu, col: 0, row: 0, w: 16, h: 9 },
+                GridItem { id: CardId::Memory, col: 16, row: 0, w: 16, h: 9 },
+                GridItem { id: CardId::Gpu, col: 32, row: 0, w: 16, h: 9 },
+                GridItem { id: CardId::Network, col: 0, row: 9, w: 20, h: 8 },
+                GridItem { id: CardId::Storage, col: 20, row: 9, w: 14, h: 8 },
+                GridItem { id: CardId::Battery, col: 34, row: 9, w: 14, h: 8 },
+                GridItem { id: CardId::Processes, col: 0, row: 17, w: 20, h: 10 },
+                GridItem { id: CardId::Thermal, col: 20, row: 17, w: 14, h: 5 },
+                GridItem { id: CardId::Audio, col: 34, row: 17, w: 14, h: 5 },
+                GridItem { id: CardId::Uptime, col: 20, row: 22, w: 14, h: 5 },
+                GridItem { id: CardId::System, col: 34, row: 22, w: 14, h: 5 },
+                GridItem { id: CardId::Devices, col: 0, row: 27, w: 48, h: 5 },
             ],
         }
     }

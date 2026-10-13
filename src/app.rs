@@ -1,78 +1,242 @@
+//! Application state and the per-frame loop.
+//!
+//! The window is split into a sidebar ([`crate::shell`]) and a page area. Each
+//! page lives in its own module under [`crate::pages`] as an `impl EcoView`
+//! block, so they all share this state.
+
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use eframe::egui::{self, Color32, Pos2, Rect, Sense, Vec2};
+use chrono::{DateTime, Local, Timelike};
+use eframe::egui::{self, Color32, Key, KeyboardShortcut, Modifiers, Pos2, Rect, Vec2};
 
-use crate::raccoon::chip::Chip;
-use crate::raccoon::overlay::Overlay;
-use crate::raccoon::World;
-use crate::format;
-use crate::grid::{CardId, COLS};
-use crate::icons::{self, Icon};
+use crate::grid::CardId;
+use crate::icons::Icon;
 use crate::metrics::{self, Metrics};
 use crate::notifications::NotifyTx;
 use crate::particles::Ambient;
-use crate::settings::{Settings, ThemeKind};
+use crate::raccoon::World;
+use crate::raccoon::chip::Chip;
+use crate::raccoon::overlay::Overlay;
+use crate::settings::Settings;
 use crate::sound::{self, Cue, SoundTx};
 use crate::theme::Palette;
-use crate::ui;
+use crate::widgets;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Page {
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Page {
     Overview,
     Performance,
     Processes,
     Storage,
+    Devices,
+    System,
     Settings,
 }
 
-pub struct EcoView {
-    settings: Settings,
-    settings_shared: Arc<Mutex<Settings>>,
-    metrics: Arc<Mutex<Metrics>>,
-    refresh_ms: Arc<Mutex<u64>>,
-    sound_gain: Arc<Mutex<(bool, f32)>>,
-    notify: NotifyTx,
-    sound: SoundTx,
-    ambient: Ambient,
-    /// The raccoon and his always-on-top overlay window.
-    raccoon: Overlay,
-    chip: Chip,
-    raccoon_shown: bool,
-    /// The display he lives on, re-checked now and then.
-    stage: Option<(Rect, Rect)>,
-    stage_checked: Option<Instant>,
-    cards_sent: Vec<Rect>,
-    page: Page,
-    last_frame: Instant,
-    pulse: f32,
-    edit_layout: bool,
-    drag: Option<(CardId, DragKind, Vec2)>,
-    toast: Option<(String, f32)>,
-    banner: Option<String>,
-    last_warn: Instant,
-    platforms: Vec<Rect>,
+impl Page {
+    pub const ALL: [Page; 7] =
+        [Page::Overview, Page::Performance, Page::Processes, Page::Storage, Page::Devices, Page::System, Page::Settings];
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Page::Overview => "Overview",
+            Page::Performance => "Performance",
+            Page::Processes => "Processes",
+            Page::Storage => "Storage",
+            Page::Devices => "Devices",
+            Page::System => "System",
+            Page::Settings => "Settings",
+        }
+    }
+
+    pub fn icon(self) -> Icon {
+        match self {
+            Page::Overview => Icon::Overview,
+            Page::Performance => Icon::Perf,
+            Page::Processes => Icon::Processes,
+            Page::Storage => Icon::Storage,
+            Page::Devices => Icon::Devices,
+            Page::System => Icon::System,
+            Page::Settings => Icon::Settings,
+        }
+    }
+
+    pub fn from_name(s: &str) -> Option<Page> {
+        Page::ALL.into_iter().find(|p| p.title().eq_ignore_ascii_case(s))
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Level {
+    Info,
+    Ok,
+    Warn,
+    Crit,
+}
+
+impl Level {
+    pub fn color(self, pal: &Palette) -> Color32 {
+        match self {
+            Level::Info => pal.info,
+            Level::Ok => pal.ok,
+            Level::Warn => pal.warn,
+            Level::Crit => pal.crit,
+        }
+    }
+
+    pub fn icon(self) -> Icon {
+        match self {
+            Level::Info => Icon::Info,
+            Level::Ok => Icon::Check,
+            Level::Warn | Level::Crit => Icon::Warning,
+        }
+    }
+}
+
+pub struct Toast {
+    pub id: u64,
+    pub level: Level,
+    pub title: String,
+    pub body: String,
+    pub born: f64,
+    pub ttl: f32,
+}
+
+pub struct Alert {
+    pub when: DateTime<Local>,
+    pub level: Level,
+    pub title: String,
+    pub body: String,
+    pub page: Page,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ProcSort {
+    Cpu,
+    Memory,
+    Name,
+    Pid,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SettingsSection {
+    General,
+    Appearance,
+    Dashboard,
+    Alerts,
+    Sound,
+    Discord,
+    Raccoon,
+    About,
+}
+
+impl SettingsSection {
+    pub fn from_name(s: &str) -> Option<Self> {
+        use SettingsSection::*;
+        [General, Appearance, Dashboard, Alerts, Sound, Discord, Raccoon, About]
+            .into_iter()
+            .find(|x| format!("{x:?}").eq_ignore_ascii_case(s))
+    }
+}
+
+pub struct KillRequest {
+    pub pid: u32,
+    pub name: String,
+    pub force: bool,
 }
 
 #[derive(Clone, Copy)]
-enum DragKind {
+pub enum DragKind {
     Move,
     Resize,
+}
+
+pub struct EcoView {
+    pub(crate) settings: Settings,
+    pub(crate) settings_shared: Arc<Mutex<Settings>>,
+    pub(crate) metrics_shared: Arc<Mutex<Metrics>>,
+    /// This frame's copy of the metrics, refreshed only when a new sample lands.
+    pub(crate) m: Metrics,
+    m_samples: u64,
+    pub(crate) refresh_ms: Arc<Mutex<u64>>,
+    pub(crate) sound_gain: Arc<Mutex<(bool, f32)>>,
+    pub(crate) notify: NotifyTx,
+    pub(crate) sound: SoundTx,
+    pub(crate) ambient: Ambient,
+
+    // --- raccoon (unchanged behaviour, just hosted here) ---
+    pub(crate) raccoon: Overlay,
+    pub(crate) chip: Chip,
+    raccoon_shown: bool,
+    stage: Option<(Rect, Rect)>,
+    stage_checked: Option<Instant>,
+    cards_sent: Vec<Rect>,
+    pub(crate) platforms: Vec<Rect>,
+
+    // --- navigation ---
+    pub(crate) page: Page,
+    pub(crate) page_t: f64,
+    pub(crate) time: f64,
+    pub(crate) pal: Palette,
+    style_key: Option<String>,
+
+    // --- dashboard editing ---
+    pub(crate) edit_layout: bool,
+    pub(crate) drag: Option<(CardId, DragKind, Vec2)>,
+
+    // --- feedback ---
+    pub(crate) toasts: Vec<Toast>,
+    toast_seq: u64,
+    pub(crate) alerts: VecDeque<Alert>,
+    pub(crate) unread: usize,
+    last_alert: Option<Instant>,
+    pub(crate) banner: Option<(Level, String, Page)>,
+    pub(crate) alerts_open: bool,
+
+    // --- command palette ---
+    pub(crate) palette_open: bool,
+    pub(crate) palette_query: String,
+    pub(crate) palette_sel: usize,
+
+    // --- pages ---
+    pub(crate) proc_query: String,
+    pub(crate) proc_sort: ProcSort,
+    pub(crate) proc_desc: bool,
+    pub(crate) proc_selected: Option<u32>,
+    pub(crate) kill: Option<KillRequest>,
+    pub(crate) device_query: String,
+    pub(crate) device_filter: u8,
+    pub(crate) section: SettingsSection,
+    /// Headless renders skip the raccoon and anything that touches AppKit.
+    pub(crate) headless: bool,
 }
 
 impl EcoView {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let settings = Settings::load();
-        apply_icon(cc, &settings);
+        apply_icon(&cc.egui_ctx, &settings);
+        crate::theme::install_fonts(&cc.egui_ctx);
         let metrics = Arc::new(Mutex::new(Metrics::default()));
+        Self::build(settings, metrics, false)
+    }
+
+    /// Builds the app around an existing metrics feed. Used by `new` and by
+    /// the headless screenshot renderer.
+    pub fn build(settings: Settings, metrics: Arc<Mutex<Metrics>>, headless: bool) -> Self {
         let refresh_ms = Arc::new(Mutex::new(settings.refresh_ms));
-        metrics::spawn(metrics.clone(), refresh_ms.clone());
+        if !headless {
+            metrics::spawn(metrics.clone(), refresh_ms.clone());
+        }
         let settings_shared = Arc::new(Mutex::new(settings.clone()));
-        crate::discord::spawn(metrics.clone(), settings_shared.clone());
-        let sound_gain = Arc::new(Mutex::new((settings.sound_enabled, settings.sound_volume)));
+        if !headless {
+            crate::discord::spawn(metrics.clone(), settings_shared.clone());
+        }
+        let sound_gain = Arc::new(Mutex::new((settings.sound_enabled && !headless, settings.sound_volume)));
         let notify = crate::notifications::spawn();
         let sound = sound::spawn(sound_gain.clone());
-        if settings.autostart && !crate::autostart::is_enabled() {
+        if !headless && settings.autostart && !crate::autostart::is_enabled() {
             let _ = crate::autostart::set_enabled(true);
         }
         let seed = std::time::SystemTime::now()
@@ -85,42 +249,64 @@ impl EcoView {
         if let Some(pos) = settings.companion_chip_pos {
             chip.set_pos(pos);
         }
+        let pal = Palette::from_settings(&settings);
         Self {
+            m: Metrics::default(),
+            m_samples: u64::MAX,
+            metrics_shared: metrics,
             raccoon,
             chip,
             raccoon_shown: false,
             stage: None,
             stage_checked: None,
             cards_sent: Vec::new(),
+            platforms: Vec::new(),
             settings,
             settings_shared,
-            metrics,
             refresh_ms,
             sound_gain,
             notify,
             sound,
             ambient: Ambient::new(),
             page: Page::Overview,
-            last_frame: Instant::now(),
-            pulse: 0.0,
+            page_t: -10.0,
+            time: 0.0,
+            pal,
+            style_key: None,
             edit_layout: false,
             drag: None,
-            toast: None,
+            toasts: Vec::new(),
+            toast_seq: 0,
+            alerts: VecDeque::new(),
+            unread: 0,
+            last_alert: None,
             banner: None,
-            // `Instant - Duration` panics on underflow; uptime may be shorter than 30s.
-            last_warn: Instant::now()
-                .checked_sub(std::time::Duration::from_secs(30))
-                .unwrap_or_else(Instant::now),
-            platforms: Vec::new(),
+            alerts_open: false,
+            palette_open: false,
+            palette_query: String::new(),
+            palette_sel: 0,
+            proc_query: String::new(),
+            proc_sort: ProcSort::Cpu,
+            proc_desc: true,
+            proc_selected: None,
+            kill: None,
+            device_query: String::new(),
+            device_filter: 0,
+            section: SettingsSection::General,
+            headless,
         }
     }
 
-    fn persist(&mut self) {
+    /// Saves settings and pushes them to everything that keeps a copy.
+    pub(crate) fn persist(&mut self) {
+        self.settings.sanitize();
         self.settings.companion_chip_pos = self.chip.pos();
         if let Ok(mut w) = self.raccoon.world.lock() {
             w.set_settings(&self.settings.companion);
         }
-        self.settings.save();
+        if !self.headless {
+            self.settings.save();
+        }
         if let Ok(mut g) = self.settings_shared.lock() {
             *g = self.settings.clone();
         }
@@ -128,156 +314,248 @@ impl EcoView {
             *g = self.settings.refresh_ms;
         }
         if let Ok(mut g) = self.sound_gain.lock() {
-            *g = (self.settings.sound_enabled, self.settings.sound_volume);
+            *g = (self.settings.sound_enabled && !self.headless, self.settings.sound_volume);
         }
     }
-}
 
-impl eframe::App for EcoView {
-    /// Fully transparent, so the raccoon's overlay window (which shares this
-    /// GL setup) shows only what it paints. The dashboard paints its own
-    /// opaque background over every pixel.
-    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        [0.0; 4]
+    pub(crate) fn go(&mut self, page: Page) {
+        if self.page != page {
+            self.page = page;
+            self.page_t = self.time;
+            self.sound.play(Cue::Click);
+        }
     }
 
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        let dt = self.last_frame.elapsed().as_secs_f32().clamp(0.0, 0.05);
-        self.last_frame = Instant::now();
-        self.pulse = (self.pulse + dt).fract();
+    pub(crate) fn toast(&mut self, level: Level, title: impl Into<String>, body: impl Into<String>) {
+        self.toast_seq += 1;
+        self.toasts.push(Toast {
+            id: self.toast_seq,
+            level,
+            title: title.into(),
+            body: body.into(),
+            born: self.time,
+            ttl: 4.5,
+        });
+        if self.toasts.len() > 4 {
+            self.toasts.remove(0);
+        }
+    }
 
-        // A card drag can outlive the pointer release if the panel that owns it
-        // stops running (page switch, or "Edit layout" toggled off while held),
-        // which would otherwise re-apply the stale drag against the new cursor.
-        if ctx.input(|i| i.pointer.any_released()) {
+    /// Steps of the refresh interval, in seconds.
+    pub(crate) fn step_secs(&self) -> f32 {
+        self.settings.refresh_ms as f32 / 1000.0
+    }
+
+    /// 0..100 summary of how the machine is doing, plus a short verdict.
+    pub(crate) fn health(&self) -> (f32, &'static str, Level) {
+        let s = &self.m.snap;
+        let mut score = 100.0_f32;
+        score -= (s.cpu_global - 70.0).max(0.0) * 0.9;
+        score -= (metrics::pct(s.mem_used, s.mem_total) - 80.0).max(0.0) * 1.2;
+        if let Some(t) = &s.temperature {
+            score -= (t.celsius - 80.0).max(0.0) * 1.5;
+        }
+        if let Some(g) = s.gpu.load {
+            score -= (g - 85.0).max(0.0) * 0.6;
+        }
+        if let Some(d) = s.disks.first() {
+            let used = metrics::pct(d.total.saturating_sub(d.available), d.total);
+            score -= (used - 90.0).max(0.0) * 2.0;
+        }
+        if let Some(b) = &s.battery
+            && !b.charging
+        {
+            score -= (20.0 - b.percent).max(0.0);
+        }
+        let score = score.clamp(0.0, 100.0);
+        if score >= 85.0 {
+            (score, "Running smoothly", Level::Ok)
+        } else if score >= 60.0 {
+            (score, "Working hard", Level::Warn)
+        } else {
+            (score, "Under heavy strain", Level::Crit)
+        }
+    }
+
+    /// Everything drawn in one frame. `eframe::App::update` and the headless
+    /// renderer both call this.
+    pub fn frame(&mut self, ctx: &egui::Context) {
+        let now = ctx.input(|i| i.time);
+        let dt = ((now - self.time) as f32).clamp(0.0, 0.1);
+        self.time = now;
+
+        // Style only needs rebuilding when something that affects it changes.
+        self.pal = Palette::from_settings(&self.settings);
+        let key = format!(
+            "{:?}{}{:?}{:?}{}{}",
+            self.settings.theme, self.settings.custom_accent, self.settings.accent, self.settings.accent_alt, self.settings.text_scale, self.settings.compact
+        );
+        if self.style_key.as_deref() != Some(key.as_str()) {
+            self.pal.apply(ctx, self.settings.text_scale, self.settings.compact);
+            self.style_key = Some(key);
+        }
+        widgets::set_reduce_motion(ctx, self.settings.reduce_motion);
+
+        if let Ok(m) = self.metrics_shared.lock()
+            && m.history.samples != self.m_samples
+        {
+            self.m_samples = m.history.samples;
+            self.m = m.clone();
+        }
+
+        if ctx.input(|i| i.pointer.any_released()) || !self.edit_layout {
             self.drag = None;
         }
-        if !self.edit_layout {
-            self.drag = None;
-        }
 
-        let pal = Palette::from_settings(&self.settings);
-        pal.apply(ctx, self.settings.text_scale);
+        self.shortcuts(ctx);
+        self.check_alerts();
+        self.toasts.retain(|t| (self.time - t.born) < t.ttl as f64 + 0.4);
 
-        let metrics = self.metrics.lock().map(|m| m.clone()).unwrap_or_default();
-        self.check_warnings(&metrics);
-
-        if let Some((_, ttl)) = self.toast.as_mut() {
-            *ttl -= dt;
-        }
-        if self.toast.as_ref().is_some_and(|(_, t)| *t <= 0.0) {
-            self.toast = None;
-        }
-
+        // Background: a soft vertical gradient plus the optional ambient effect.
         let screen = ctx.screen_rect();
         let painter = ctx.layer_painter(egui::LayerId::background());
+        let pal = self.pal;
         painter.rect_filled(screen, 0.0, pal.bg);
-        self.ambient.paint(
-            &painter,
-            screen,
-            pal,
-            self.settings.particles,
-            self.settings.particle_intensity,
-            dt,
-        );
+        widgets::gradient_rect(&painter, screen, pal.bg_top, pal.bg, egui::CornerRadius::ZERO, false);
+        self.ambient.paint(&painter, screen, pal, self.settings.particles, self.settings.particle_intensity, dt);
 
-        egui::TopBottomPanel::top("nav")
-            .exact_height(56.0)
-            .frame(egui::Frame::new().fill(pal.panel).inner_margin(egui::Margin::symmetric(12, 8)))
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new("eco view")
-                            .size(20.0)
-                            .color(pal.accent)
-                            .strong(),
-                    );
-                    ui.add_space(12.0);
-                    self.nav_btn(ui, pal, Page::Overview, Icon::Overview, "Overview");
-                    self.nav_btn(ui, pal, Page::Performance, Icon::Perf, "Performance");
-                    self.nav_btn(ui, pal, Page::Processes, Icon::Processes, "Processes");
-                    self.nav_btn(ui, pal, Page::Storage, Icon::Storage, "Storage");
-                    self.nav_btn(ui, pal, Page::Settings, Icon::Settings, "Settings");
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if self.page == Page::Overview
-                            && ui
-                                .add(egui::Button::new(if self.edit_layout {
-                                    "Lock layout"
-                                } else {
-                                    "Edit layout"
-                                }))
-                                .clicked()
-                        {
-                            self.edit_layout = !self.edit_layout;
-                            self.sound.play(Cue::Click);
-                        }
-                        ui.label(
-                            egui::RichText::new(&metrics.snap.hostname)
-                                .color(pal.muted)
-                                .small(),
-                        );
-                    });
-                });
-            });
-
-        if let Some(banner) = self.banner.clone()
-            && self.settings.show_banner
-        {
-            egui::TopBottomPanel::top("banner")
-                .frame(
-                    egui::Frame::new()
-                        .fill(Color32::from_rgba_unmultiplied(pal.warn.r(), pal.warn.g(), pal.warn.b(), 40))
-                        .inner_margin(8.0),
-                )
-                .show(ctx, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new(banner).color(pal.warn));
-                        if ui.button("Dismiss").clicked() {
-                            self.banner = None;
-                        }
-                    });
-                });
-        }
-
-        // Card rects are also the raccoon's walkable platforms. Rebuild this every
-        // frame so it never lags a page switch and the NPC never walks on
-        // cards that are no longer on screen.
+        self.sidebar(ctx);
         self.platforms.clear();
-        let mut collected = Vec::new();
+        let mut cards = Vec::new();
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(14, 10)))
+            .frame(egui::Frame::new().inner_margin(egui::Margin { left: 24, right: 24, top: 14, bottom: 16 }))
             .show(ctx, |ui| {
+                self.header(ui);
+                self.banner_strip(ui);
+                // Pages fade and rise in.
+                let age = (self.time - self.page_t) as f32;
+                let t = if self.settings.reduce_motion { 1.0 } else { (age / 0.22).clamp(0.0, 1.0) };
+                if t < 1.0 {
+                    ctx.request_repaint();
+                }
+                let ease = 1.0 - (1.0 - t).powi(3);
+                ui.set_opacity(ease);
+                ui.add_space((1.0 - ease) * 10.0);
                 match self.page {
-                    Page::Overview => self.overview(ui, pal, &metrics, &mut collected),
-                    Page::Performance => self.performance(ui, pal, &metrics),
-                    Page::Processes => self.processes(ui, pal, &metrics),
-                    Page::Storage => self.storage(ui, pal, &metrics),
-                    Page::Settings => self.settings_page(ui, pal, ctx),
+                    Page::Overview => self.overview(ui, &mut cards),
+                    Page::Performance => self.performance(ui),
+                    Page::Processes => self.processes(ui),
+                    Page::Storage => self.storage(ui),
+                    Page::Devices => self.devices(ui),
+                    Page::System => self.system(ui),
+                    Page::Settings => self.settings_page(ui),
                 }
             });
-        self.platforms = collected;
+        self.platforms = cards;
 
-        if let Some((msg, _)) = self.toast.clone()
-            && self.settings.show_toasts
-        {
-            egui::Area::new(egui::Id::new("toast"))
-                .order(egui::Order::Foreground)
-                .anchor(egui::Align2::RIGHT_BOTTOM, [-18.0, -18.0])
-                // Purely informational: don't let it steal clicks from
-                // whatever card happens to sit underneath.
-                .interactable(false)
-                .show(ctx, |ui| {
-                    egui::Frame::new()
-                        .fill(pal.panel)
-                        .stroke(egui::Stroke::new(1.0_f32, pal.accent))
-                        .corner_radius(10.0)
-                        .inner_margin(10.0)
-                        .show(ui, |ui| {
-                            ui.label(msg);
-                        });
-                });
+        self.toasts_layer(ctx);
+        self.alerts_popover(ctx);
+        self.kill_modal(ctx);
+        self.command_palette(ctx);
+
+        if !self.headless {
+            self.raccoon_chip(ctx);
+            self.drive_raccoon(ctx);
         }
 
+        // Frame pacing: smooth when something animates, otherwise just often
+        // enough to show new samples.
+        let busy = self.settings.particles != crate::particles::ParticleStyle::Off && self.settings.particle_intensity > 0.01;
+        let ms = if busy || self.drag.is_some() { 33 } else { 250 };
+        ctx.request_repaint_after(std::time::Duration::from_millis(ms));
+    }
+
+    fn shortcuts(&mut self, ctx: &egui::Context) {
+        let cmd = Modifiers::COMMAND;
+        let pressed = |ctx: &egui::Context, k: Key| ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(cmd, k)));
+        if pressed(ctx, Key::K) {
+            self.palette_open = !self.palette_open;
+            self.palette_query.clear();
+            self.palette_sel = 0;
+        }
+        let keys = [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5, Key::Num6];
+        for (i, k) in keys.iter().enumerate() {
+            if pressed(ctx, *k) {
+                self.go(Page::ALL[i]);
+            }
+        }
+        if pressed(ctx, Key::Comma) {
+            self.go(Page::Settings);
+        }
+        if pressed(ctx, Key::E) && self.page == Page::Overview {
+            self.edit_layout = !self.edit_layout;
+        }
+        if pressed(ctx, Key::B) {
+            self.settings.sidebar_collapsed = !self.settings.sidebar_collapsed;
+            self.persist();
+        }
+        if ctx.input(|i| i.key_pressed(Key::Escape)) {
+            if self.palette_open {
+                self.palette_open = false;
+            } else if self.kill.is_some() {
+                self.kill = None;
+            } else if self.alerts_open {
+                self.alerts_open = false;
+            } else if self.edit_layout {
+                self.edit_layout = false;
+            }
+        }
+    }
+
+    /// Raises an alert when a threshold is crossed (with a cooldown).
+    fn check_alerts(&mut self) {
+        if self.m.history.samples == 0 {
+            return;
+        }
+        let cooldown = self.settings.alert_cooldown_secs as u64;
+        if self.last_alert.is_some_and(|t| t.elapsed().as_secs() < cooldown) {
+            return;
+        }
+        let s = &self.m.snap;
+        let mem = metrics::pct(s.mem_used, s.mem_total);
+        let found: Option<(Level, String, String, Page)> = if s.cpu_global >= self.settings.warn_cpu {
+            Some((Level::Crit, format!("CPU at {:.0}%", s.cpu_global), format!("Above your {:.0}% limit", self.settings.warn_cpu), Page::Processes))
+        } else if mem >= self.settings.warn_ram {
+            Some((Level::Warn, format!("Memory at {mem:.0}%"), format!("Above your {:.0}% limit", self.settings.warn_ram), Page::Performance))
+        } else if s.gpu.load.unwrap_or(0.0) >= self.settings.warn_gpu {
+            Some((Level::Warn, format!("GPU at {:.0}%", s.gpu.load.unwrap_or(0.0)), format!("Above your {:.0}% limit", self.settings.warn_gpu), Page::Performance))
+        } else if let Some(t) = s.temperature.as_ref().filter(|t| t.celsius >= self.settings.warn_temp) {
+            Some((Level::Crit, format!("Running hot: {:.0}°C", t.celsius), format!("{} is above {:.0}°C", t.source, self.settings.warn_temp), Page::Performance))
+        } else {
+            None
+        };
+        let Some((level, title, body, page)) = found else { return };
+        self.last_alert = Some(Instant::now());
+        self.alerts.push_front(Alert { when: Local::now(), level, title: title.clone(), body: body.clone(), page });
+        self.alerts.truncate(100);
+        self.unread += 1;
+        if self.settings.show_banner {
+            self.banner = Some((level, format!("{title} — {body}"), page));
+        }
+        if self.settings.show_toasts {
+            self.toast(level, title.clone(), body.clone());
+        }
+        if self.settings.native_alerts && !self.headless {
+            self.notify.post(format!("{title}. {body}"));
+        }
+        self.sound.play(Cue::Warn);
+    }
+
+    pub(crate) fn greeting(&self) -> &'static str {
+        match Local::now().hour() {
+            5..=11 => "Good morning",
+            12..=17 => "Good afternoon",
+            18..=22 => "Good evening",
+            _ => "Burning the midnight oil",
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Raccoon hosting. The raccoon itself is finished; this only keeps his
+    // overlay alive and tells him where the dashboard cards are.
+    // ------------------------------------------------------------------
+
+    fn raccoon_chip(&mut self, ctx: &egui::Context) {
         let enabled = self.settings.companion.enabled;
         let status = self
             .raccoon
@@ -286,631 +564,22 @@ impl eframe::App for EcoView {
             .map(|w| format!("{}: {}", self.settings.companion.name, w.act.label()))
             .unwrap_or_default();
         let raccoon_pal = self.settings.companion.palette();
-        let chip = self.chip.paint(ctx, enabled, pal.accent, &raccoon_pal, &status);
+        let chip = self.chip.paint(ctx, enabled, self.pal.accent, &raccoon_pal, &status);
         if chip.toggled {
             self.sound.play(Cue::Accent);
             self.settings.companion.enabled = !enabled;
         }
-        if chip.summon {
-            if let Ok(mut w) = self.raccoon.world.lock() {
-                let at = ctx
-                    .input(|i| i.viewport().inner_rect)
-                    .map(|r| r.center())
-                    .unwrap_or(w.area.center());
-                w.summon(at);
-            }
+        if chip.summon
+            && let Ok(mut w) = self.raccoon.world.lock()
+        {
+            let at = ctx.input(|i| i.viewport().inner_rect).map(|r| r.center()).unwrap_or(w.area.center());
+            w.summon(at);
         }
         if chip.toggled || self.chip.settled() {
             self.persist();
         }
-
-        self.drive_raccoon(ctx);
-
-        ctx.request_repaint_after(std::time::Duration::from_millis(16));
-    }
-}
-
-impl EcoView {
-    fn nav_btn(&mut self, ui: &mut egui::Ui, pal: Palette, page: Page, icon: Icon, label: &str) {
-        let selected = self.page == page;
-        let fill = if selected {
-            pal.accent.gamma_multiply(0.2)
-        } else {
-            Color32::TRANSPARENT
-        };
-        let btn = egui::Frame::new()
-            .fill(fill)
-            .corner_radius(8.0)
-            .inner_margin(egui::Margin::symmetric(8, 6))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    let (r, p) = ui.allocate_painter(Vec2::splat(16.0), Sense::hover());
-                    icons::paint(&p, r.rect.min, 16.0, icon, if selected { pal.accent } else { pal.muted });
-                    ui.label(
-                        egui::RichText::new(label).color(if selected { pal.accent } else { pal.text }),
-                    );
-                });
-            })
-            .response
-            .interact(Sense::click());
-        if btn.clicked() {
-            self.page = page;
-            self.sound.play(Cue::Click);
-        }
     }
 
-    fn overview(
-        &mut self,
-        ui: &mut egui::Ui,
-        pal: Palette,
-        metrics: &Metrics,
-        platforms: &mut Vec<Rect>,
-    ) {
-        let avail = ui.available_size();
-        let col_w = (avail.x / COLS as f32).max(8.0);
-        let row_h = 22.0;
-        let max_row = self.settings.layout.max_row();
-        let (full, _) = ui.allocate_exact_size(
-            Vec2::new(avail.x, (max_row as f32 * row_h).max(avail.y)),
-            Sense::hover(),
-        );
-        let origin = full.min;
-        let visible: Vec<CardId> = self.settings.visible.clone();
-        for item in self.settings.layout.items.clone() {
-            if !visible.contains(&item.id) {
-                continue;
-            }
-            let rect = Rect::from_min_size(
-                Pos2::new(
-                    origin.x + item.col as f32 * col_w,
-                    origin.y + item.row as f32 * row_h,
-                ),
-                Vec2::new(item.w as f32 * col_w - 8.0, item.h as f32 * row_h - 8.0),
-            );
-            self.draw_card(ui, pal, metrics, item.id, rect);
-            platforms.push(rect);
-            if self.edit_layout {
-                self.layout_handles(ui, item.id, rect, col_w, row_h, origin);
-            }
-        }
-    }
-
-    fn layout_handles(
-        &mut self,
-        ui: &mut egui::Ui,
-        id: CardId,
-        rect: Rect,
-        col_w: f32,
-        row_h: f32,
-        origin: Pos2,
-    ) {
-        let move_rect = Rect::from_min_size(rect.min, Vec2::splat(16.0));
-        let resize_rect = Rect::from_min_size(rect.max - Vec2::splat(16.0), Vec2::splat(16.0));
-        let move_id = ui.make_persistent_id(("mv", id.title()));
-        let resize_id = ui.make_persistent_id(("rs", id.title()));
-        let move_r = ui.interact(move_rect, move_id, Sense::click_and_drag());
-        let resize_r = ui.interact(resize_rect, resize_id, Sense::click_and_drag());
-        ui.painter().rect_filled(move_rect, 3.0, Color32::from_rgb(80, 255, 200));
-        ui.painter().rect_filled(resize_rect, 3.0, Color32::from_rgb(255, 180, 80));
-        if move_r.drag_started() {
-            self.drag = Some((id, DragKind::Move, Vec2::ZERO));
-        }
-        if resize_r.drag_started() {
-            self.drag = Some((id, DragKind::Resize, Vec2::ZERO));
-        }
-        let Some((_, kind, _)) = self.drag.filter(|(drag_id, _, _)| *drag_id == id) else {
-            return;
-        };
-        let Some(pointer) = ui.ctx().pointer_latest_pos() else {
-            return;
-        };
-        let Some(item) = self.settings.layout.items.iter().find(|i| i.id == id).cloned()
-        else {
-            return;
-        };
-        // `try_place` reports whether anything actually changed, so this saves
-        // once per real edit instead of once per frame of the drag.
-        let changed = match kind {
-            DragKind::Move => {
-                let col = ((pointer.x - origin.x) / col_w).round() as i32;
-                let row = ((pointer.y - origin.y) / row_h).round() as i32;
-                self.settings.layout.try_place(id, col, row, item.w, item.h)
-            }
-            DragKind::Resize => {
-                // Cards are drawn with an 8px inset, so measure against the
-                // card's own top-left rather than the raw grid origin.
-                let x0 = origin.x + item.col as f32 * col_w;
-                let y0 = origin.y + item.row as f32 * row_h;
-                let w = ((pointer.x - x0) / col_w).round() as i32;
-                let h = ((pointer.y - y0) / row_h).round() as i32;
-                self.settings.layout.try_place(id, item.col, item.row, w, h)
-            }
-        };
-        if changed {
-            self.persist();
-        }
-    }
-
-    fn draw_card(&mut self, ui: &mut egui::Ui, pal: Palette, metrics: &Metrics, id: CardId, rect: Rect) {
-        ui.allocate_new_ui(
-            egui::UiBuilder::new()
-                .max_rect(rect)
-                .layout(egui::Layout::top_down(egui::Align::Min)),
-            |ui| {
-        ui::card_chrome(ui, pal, id, self.pulse, |ui| match id {
-            CardId::Cpu => {
-                ui::kpi(ui, pal, format!("{:.0}", metrics.snap.cpu_global), "%");
-                ui::meter(ui, metrics.snap.cpu_global / 100.0, pal, ui::warn_value(metrics.snap.cpu_global, self.settings.warn_cpu));
-                ui::sparkline(ui, &metrics.history.cpu, 100.0, pal.accent, 36.0);
-                if self.settings.cpu_heatmap {
-                    ui::heatmap_cores(ui, &metrics.snap.cpu_per_core);
-                } else {
-                    ui.label(egui::RichText::new(&metrics.snap.cpu_brand).small().color(pal.muted));
-                }
-            }
-            CardId::Memory => {
-                let p = metrics::pct(metrics.snap.mem_used, metrics.snap.mem_total);
-                ui::kpi(ui, pal, format!("{p:.0}"), "%");
-                ui.label(
-                    egui::RichText::new(format!(
-                        "{} / {}",
-                        format::bytes(metrics.snap.mem_used),
-                        format::bytes(metrics.snap.mem_total)
-                    ))
-                    .small()
-                    .color(pal.muted),
-                );
-                ui::meter(ui, p / 100.0, pal, ui::warn_value(p, self.settings.warn_ram));
-                ui::sparkline(ui, &metrics.history.ram, 100.0, pal.accent_alt, 32.0);
-                let sw = metrics::pct(metrics.snap.swap_used, metrics.snap.swap_total);
-                ui.label(format!("Swap {sw:.0}%"));
-            }
-            CardId::Gpu => {
-                if let Some(load) = metrics.snap.gpu.load {
-                    ui::kpi(ui, pal, format!("{load:.0}"), "%");
-                    ui::meter(ui, load / 100.0, pal, ui::warn_value(load, self.settings.warn_gpu));
-                } else {
-                    ui.label(egui::RichText::new("unavailable").color(pal.muted));
-                }
-                if let Some(name) = &metrics.snap.gpu.name {
-                    ui.label(egui::RichText::new(name).small().color(pal.muted));
-                }
-                match (metrics.snap.gpu.mem_used, metrics.snap.gpu.mem_total) {
-                    (Some(u), Some(t)) if t > 0 => {
-                        ui.label(format!("{} / {}", format::bytes(u), format::bytes(t)));
-                    }
-                    _ => {
-                        ui.label(egui::RichText::new("GPU memory unavailable").small().color(pal.muted));
-                    }
-                }
-                ui::sparkline(ui, &metrics.history.gpu, 100.0, pal.accent, 28.0);
-            }
-            CardId::Network => {
-                ui.label(format!("↓ {}", format::bps(metrics.snap.net_down_bps)));
-                ui.label(format!("↑ {}", format::bps(metrics.snap.net_up_bps)));
-                ui::sparkline(ui, &metrics.history.net_down, spark_max(&metrics.history.net_down), pal.ok, 28.0);
-                if self.settings.net_heatmap {
-                    ui::heatmap_net(ui, metrics.snap.net_down_bps as f32, metrics.snap.net_up_bps as f32, pal);
-                }
-            }
-            CardId::Storage => {
-                for disk in metrics.snap.disks.iter().take(3) {
-                    let used = disk.total.saturating_sub(disk.available);
-                    let p = metrics::pct(used, disk.total);
-                    ui.label(format!("{}  {p:.0}%", disk.mount));
-                    ui::meter(ui, p / 100.0, pal, p > 90.0);
-                }
-            }
-            CardId::Battery => {
-                if let Some(b) = &metrics.snap.battery {
-                    ui::kpi(ui, pal, format!("{:.0}", b.percent), "%");
-                    ui.label(if b.charging { "Charging" } else { "On battery" });
-                    if let Some(r) = &b.remaining {
-                        ui.label(egui::RichText::new(r).small().color(pal.muted));
-                    }
-                    ui::meter(ui, b.percent / 100.0, pal, b.percent < 15.0 && !b.charging);
-                } else {
-                    ui.label("No battery");
-                }
-            }
-            CardId::Audio => {
-                if let Some(v) = metrics.snap.audio.volume {
-                    ui::kpi(ui, pal, format!("{:.0}", v * 100.0), "%");
-                    ui::meter(ui, v, pal, false);
-                    ui::sparkline(ui, &metrics.history.audio, 100.0, pal.accent_alt, 24.0);
-                } else {
-                    ui.label("Output level unavailable");
-                }
-                if metrics.snap.audio.muted {
-                    ui.label(egui::RichText::new("Muted").color(pal.warn));
-                }
-                if let Some(d) = &metrics.snap.audio.device {
-                    ui.label(egui::RichText::new(d).small().color(pal.muted));
-                }
-            }
-            CardId::Thermal => {
-                if let Some(t) = &metrics.snap.temperature {
-                    ui::kpi(ui, pal, format!("{:.0}", t.celsius), "°C");
-                    ui::meter(ui, (t.celsius / 110.0).clamp(0.0, 1.0), pal, t.celsius >= self.settings.warn_temp);
-                    ui.label(egui::RichText::new(&t.source).small().color(pal.muted));
-                } else {
-                    ui.label("No SMC reading");
-                }
-            }
-            CardId::Uptime => {
-                ui::kpi(ui, pal, format::uptime(metrics.snap.uptime_secs), "");
-                ui.label(egui::RichText::new(&metrics.snap.os).small().color(pal.muted));
-            }
-            CardId::Processes => {
-                for proc in metrics.snap.processes.iter().take(6) {
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new(format!("{:>5.1}%", proc.cpu)).color(pal.accent).monospace());
-                        ui.label(truncate(&proc.name, 22));
-                    });
-                }
-            }
-            CardId::Devices => {
-                for d in metrics.snap.devices.iter().take(7) {
-                    let tag = match d.kind {
-                        crate::devices::DeviceKind::Controller => "🎮",
-                        crate::devices::DeviceKind::Bluetooth => "bluetooth",
-                        crate::devices::DeviceKind::Usb => "usb",
-                        crate::devices::DeviceKind::Hid => "hid",
-                    };
-                    ui.label(format!("{tag}  {}", truncate(&d.name, 28)));
-                }
-                if metrics.snap.devices.is_empty() {
-                    ui.label(egui::RichText::new("Scanning IOKit…").color(pal.muted));
-                }
-            }
-            CardId::System => {
-                ui.label(&metrics.snap.hostname);
-                ui.label(egui::RichText::new(&metrics.snap.os).small().color(pal.muted));
-                ui.label(egui::RichText::new(format!("kernel {}", metrics.snap.kernel)).small().color(pal.muted));
-                ui.label(egui::RichText::new(&metrics.snap.cpu_brand).small().color(pal.muted));
-                ui.label(format!("{} logical cores · Intel-friendly OpenGL", metrics.snap.cpu_cores));
-            }
-        });
-            },
-        );
-    }
-
-    fn performance(&mut self, ui: &mut egui::Ui, pal: Palette, metrics: &Metrics) {
-        ui.heading("Performance");
-        ui.add_space(8.0);
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            ui.columns(2, |cols| {
-                ui::card_chrome(&mut cols[0], pal, CardId::Cpu, self.pulse, |ui| {
-                    ui::kpi(ui, pal, format!("{:.1}", metrics.snap.cpu_global), "%");
-                    ui::sparkline(ui, &metrics.history.cpu, 100.0, pal.accent, 70.0);
-                    ui::heatmap_cores(ui, &metrics.snap.cpu_per_core);
-                });
-                ui::card_chrome(&mut cols[1], pal, CardId::Memory, self.pulse, |ui| {
-                    let p = metrics::pct(metrics.snap.mem_used, metrics.snap.mem_total);
-                    ui::kpi(ui, pal, format!("{p:.1}"), "%");
-                    ui::sparkline(ui, &metrics.history.ram, 100.0, pal.accent_alt, 70.0);
-                    ui.label(format!(
-                        "{} used of {}",
-                        format::bytes(metrics.snap.mem_used),
-                        format::bytes(metrics.snap.mem_total)
-                    ));
-                });
-            });
-            ui.add_space(8.0);
-            ui.columns(2, |cols| {
-                ui::card_chrome(&mut cols[0], pal, CardId::Gpu, self.pulse, |ui| {
-                    ui.label(metrics.snap.gpu.name.clone().unwrap_or_else(|| "GPU".into()));
-                    match metrics.snap.gpu.load {
-                        Some(_v) => ui::sparkline(ui, &metrics.history.gpu, 100.0, pal.accent, 64.0),
-                        None => {
-                            ui.label("IOAccelerator did not publish utilization.");
-                        }
-                    }
-                    let _ = metrics.snap.gpu.load;
-                });
-                ui::card_chrome(&mut cols[1], pal, CardId::Network, self.pulse, |ui| {
-                    ui.label(format!("Down {}", format::bps(metrics.snap.net_down_bps)));
-                    ui::sparkline(ui, &metrics.history.net_down, spark_max(&metrics.history.net_down), pal.ok, 48.0);
-                    ui.label(format!("Up {}", format::bps(metrics.snap.net_up_bps)));
-                    ui::sparkline(ui, &metrics.history.net_up, spark_max(&metrics.history.net_up), pal.warn, 48.0);
-                });
-            });
-        });
-    }
-
-    fn processes(&mut self, ui: &mut egui::Ui, pal: Palette, metrics: &Metrics) {
-        ui.heading("Processes");
-        ui.add_space(6.0);
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            egui::Grid::new("procs")
-                .striped(true)
-                .num_columns(4)
-                .min_col_width(80.0)
-                .show(ui, |ui| {
-                    ui.strong("PID");
-                    ui.strong("Name");
-                    ui.strong("CPU");
-                    ui.strong("Memory");
-                    ui.end_row();
-                    for proc in &metrics.snap.processes {
-                        ui.monospace(proc.pid.to_string());
-                        ui.label(&proc.name);
-                        ui.colored_label(pal.accent, format!("{:.1}%", proc.cpu));
-                        ui.label(format::bytes(proc.memory));
-                        ui.end_row();
-                    }
-                });
-        });
-    }
-
-    fn storage(&mut self, ui: &mut egui::Ui, pal: Palette, metrics: &Metrics) {
-        ui.heading("Storage");
-        ui.add_space(8.0);
-        for disk in &metrics.snap.disks {
-            ui::card_chrome(ui, pal, CardId::Storage, self.pulse, |ui| {
-                ui.label(egui::RichText::new(&disk.name).strong());
-                ui.label(&disk.mount);
-                let used = disk.total.saturating_sub(disk.available);
-                ui.label(format!(
-                    "{} free of {}",
-                    format::bytes(disk.available),
-                    format::bytes(disk.total)
-                ));
-                ui::meter(ui, metrics::pct(used, disk.total) / 100.0, pal, false);
-            });
-            ui.add_space(8.0);
-        }
-    }
-
-    fn settings_page(&mut self, ui: &mut egui::Ui, pal: Palette, ctx: &egui::Context) {
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            ui.heading("Settings");
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                ui.label("Theme");
-                if ui.selectable_label(self.settings.theme == ThemeKind::Dark, "Dark").clicked() {
-                    self.settings.theme = ThemeKind::Dark;
-                    self.persist();
-                }
-                if ui.selectable_label(self.settings.theme == ThemeKind::Light, "Light").clicked() {
-                    self.settings.theme = ThemeKind::Light;
-                    self.persist();
-                }
-            });
-            ui.horizontal(|ui| {
-                ui.label("Accent");
-                if color_edit(ui, &mut self.settings.accent) {
-                    self.persist();
-                }
-                ui.label("Alt");
-                if color_edit(ui, &mut self.settings.accent_alt) {
-                    self.persist();
-                }
-            });
-            if ui
-                .add(egui::Slider::new(&mut self.settings.text_scale, 0.8..=1.4).text("Text scale"))
-                .changed()
-            {
-                self.persist();
-            }
-            if ui
-                .add(egui::Slider::new(&mut self.settings.refresh_ms, 250..=4000).text("Refresh (ms)"))
-                .changed()
-            {
-                self.persist();
-            }
-            ui.separator();
-            ui.label("Warning thresholds");
-            let mut thresh_dirty = false;
-            thresh_dirty |= ui
-                .add(egui::Slider::new(&mut self.settings.warn_cpu, 50.0..=100.0).text("CPU %"))
-                .changed();
-            thresh_dirty |= ui
-                .add(egui::Slider::new(&mut self.settings.warn_ram, 50.0..=100.0).text("RAM %"))
-                .changed();
-            thresh_dirty |= ui
-                .add(egui::Slider::new(&mut self.settings.warn_gpu, 50.0..=100.0).text("GPU %"))
-                .changed();
-            thresh_dirty |= ui
-                .add(egui::Slider::new(&mut self.settings.warn_temp, 50.0..=100.0).text("Temp °C"))
-                .changed();
-            if thresh_dirty {
-                self.persist();
-            }
-            ui.separator();
-            ui.label("Particles");
-            ui.horizontal_wrapped(|ui| {
-                for style in crate::particles::ParticleStyle::all() {
-                    if ui.selectable_label(self.settings.particles == *style, style.label()).clicked() {
-                        self.settings.particles = *style;
-                        self.persist();
-                    }
-                }
-            });
-            if ui
-                .add(egui::Slider::new(&mut self.settings.particle_intensity, 0.0..=1.0).text("Intensity"))
-                .changed()
-            {
-                self.persist();
-            }
-            ui.separator();
-            let mut dirty = false;
-            dirty |= ui.checkbox(&mut self.settings.show_toasts, "Toasts").changed();
-            dirty |= ui.checkbox(&mut self.settings.show_banner, "Warning banner").changed();
-            dirty |= ui.checkbox(&mut self.settings.cpu_heatmap, "CPU core heatmap").changed();
-            dirty |= ui.checkbox(&mut self.settings.net_heatmap, "Network heatmap").changed();
-            dirty |= ui.checkbox(&mut self.settings.sound_enabled, "Sounds").changed();
-            if ui
-                .add(egui::Slider::new(&mut self.settings.sound_volume, 0.0..=1.0).text("Sound volume"))
-                .changed()
-            {
-                dirty = true;
-            }
-            if ui.checkbox(&mut self.settings.autostart, "Open at login (LaunchAgent)").changed() {
-                match crate::autostart::set_enabled(self.settings.autostart) {
-                    Ok(()) => self.toast = Some(("Login item updated".into(), 3.0)),
-                    Err(e) => self.toast = Some((e, 4.0)),
-                }
-                dirty = true;
-            }
-            ui.separator();
-            ui.label("Visible tiles");
-            ui.horizontal_wrapped(|ui| {
-                for id in CardId::all() {
-                    let mut on = self.settings.visible.contains(id);
-                    if ui.checkbox(&mut on, id.title()).changed() {
-                        if on {
-                            if !self.settings.visible.contains(id) {
-                                self.settings.visible.push(*id);
-                            }
-                        } else {
-                            self.settings.visible.retain(|v| v != id);
-                        }
-                        dirty = true;
-                    }
-                }
-            });
-            ui.separator();
-            ui.label("Discord Rich Presence");
-            dirty |= ui.checkbox(&mut self.settings.discord_enabled, "Enable Discord presence").changed();
-            dirty |= ui.text_edit_singleline(&mut self.settings.discord_app_id).changed();
-            ui.label("Application ID");
-            ui.label("Details");
-            dirty |= ui.text_edit_singleline(&mut self.settings.discord_details).changed();
-            ui.label("State");
-            dirty |= ui.text_edit_singleline(&mut self.settings.discord_state).changed();
-            ui.label("Large image key");
-            dirty |= ui.text_edit_singleline(&mut self.settings.discord_large_image).changed();
-            ui.label(egui::RichText::new("{cpu} {ram} {gpu} {temp} {host} {uptime} {network_down} {network_up}").small().color(pal.muted));
-            ui.separator();
-            ui.label("Custom window icon (PNG, JPG, BMP, ICO)");
-            if ui.button("Choose icon…").clicked()
-                && let Some(path) = native_open()
-            {
-                match self.settings.set_icon_from_file(&path) {
-                    Ok(()) => {
-                        self.toast = Some(("Icon saved. Restart to apply in Dock.".into(), 4.0));
-                        dirty = true;
-                    }
-                    Err(e) => self.toast = Some((e, 4.0)),
-                }
-            }
-            if ui.button("Restore default icon").clicked() {
-                self.settings.custom_icon = None;
-                dirty = true;
-            }
-            ui.separator();
-            dirty |= self.companion_settings(ui, pal);
-            if dirty {
-                self.persist();
-            }
-            let _ = ctx;
-        });
-    }
-
-    /// The raccoon's settings. Returns true when anything changed.
-    fn companion_settings(&mut self, ui: &mut egui::Ui, pal: Palette) -> bool {
-        crate::raccoon::ui::panel(ui, pal, &mut self.settings.companion, &self.raccoon.world)
-    }
-
-    fn check_warnings(&mut self, metrics: &Metrics) {
-        if self.last_warn.elapsed().as_secs() < 20 {
-            return;
-        }
-        let snap = &metrics.snap;
-        let mut reason = None;
-        if snap.cpu_global >= self.settings.warn_cpu {
-            reason = Some(format!("CPU at {:.0}%", snap.cpu_global));
-        } else if metrics::pct(snap.mem_used, snap.mem_total) >= self.settings.warn_ram {
-            reason = Some(format!("Memory at {:.0}%", metrics::pct(snap.mem_used, snap.mem_total)));
-        } else if snap.gpu.load.unwrap_or(0.0) >= self.settings.warn_gpu {
-            reason = Some(format!("GPU at {:.0}%", snap.gpu.load.unwrap_or(0.0)));
-        } else if snap
-            .temperature
-            .as_ref()
-            .is_some_and(|t| t.celsius >= self.settings.warn_temp)
-        {
-            reason = Some(format!(
-                "Thermal {:.0}°C",
-                snap.temperature.as_ref().map(|t| t.celsius).unwrap_or(0.0)
-            ));
-        }
-        if let Some(reason) = reason {
-            self.banner = Some(reason.clone());
-            self.toast = Some((reason.clone(), 5.0));
-            self.notify.post(reason);
-            self.sound.play(Cue::Warn);
-            self.last_warn = Instant::now();
-        }
-    }
-}
-
-fn spark_max(data: &std::collections::VecDeque<f32>) -> f32 {
-    data.iter().copied().fold(1.0, f32::max) * 1.15
-}
-
-fn truncate(s: &str, n: usize) -> String {
-    if s.chars().count() <= n {
-        s.to_string()
-    } else {
-        let t: String = s.chars().take(n.saturating_sub(1)).collect();
-        format!("{t}…")
-    }
-}
-
-fn color_edit(ui: &mut egui::Ui, rgb: &mut [u8; 3]) -> bool {
-    let mut c = Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
-    let changed = ui.color_edit_button_srgba(&mut c).changed();
-    if changed {
-        *rgb = [c.r(), c.g(), c.b()];
-    }
-    changed
-}
-
-fn native_open() -> Option<std::path::PathBuf> {
-    let script = r#"POSIX path of (choose file of type {"public.png","public.jpeg","com.microsoft.bmp","com.apple.icns","public.image"} with prompt "Choose an icon")"#;
-    let output = std::process::Command::new("osascript")
-        .args(["-e", script])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if path.is_empty() {
-        None
-    } else {
-        Some(std::path::PathBuf::from(path))
-    }
-}
-
-fn apply_icon(cc: &eframe::CreationContext<'_>, settings: &Settings) {
-    let Some(path) = &settings.custom_icon else {
-        return;
-    };
-    let Ok(bytes) = std::fs::read(path) else {
-        return;
-    };
-    let Ok(img) = image::load_from_memory(&bytes) else {
-        return;
-    };
-    let rgba = img.to_rgba8();
-    let (w, h) = rgba.dimensions();
-    let icon = egui::IconData {
-        rgba: rgba.into_raw(),
-        width: w,
-        height: h,
-    };
-    cc.egui_ctx
-        .send_viewport_cmd(egui::ViewportCommand::Icon(Some(std::sync::Arc::new(icon))));
-}
-
-impl EcoView {
-    /// Keeps the raccoon's overlay window alive on the right display and
-    /// feeds it the dashboard cards he can stand on.
-    ///
-    /// The raccoon simulates and paints in the overlay's own render loop, so
-    /// this only has to hand over what the dashboard knows.
     fn drive_raccoon(&mut self, ctx: &egui::Context) {
         if !self.settings.companion.enabled {
             if self.raccoon_shown {
@@ -922,8 +591,6 @@ impl EcoView {
             }
             return;
         }
-
-        // This window's place on the desktop.
         let inner = ctx.input(|i| i.viewport().inner_rect);
         let recheck = self.stage_checked.is_none_or(|t| t.elapsed().as_secs_f32() > 1.0);
         if recheck {
@@ -934,15 +601,12 @@ impl EcoView {
             }
         }
         let Some((stage, visible)) = self.stage else { return };
-
-        // Dashboard cards are window-local; shift them onto the desktop.
         let cards: Vec<Rect> = match inner {
             Some(r) if ctx.input(|i| !i.viewport().minimized.unwrap_or(false)) => {
                 self.platforms.iter().map(|c| c.translate(r.min.to_vec2())).collect()
             }
             _ => Vec::new(),
         };
-
         if let Ok(mut w) = self.raccoon.world.lock() {
             if !self.raccoon_shown {
                 w.set_settings(&self.settings.companion);
@@ -957,4 +621,58 @@ impl EcoView {
         self.raccoon_shown = true;
         self.raccoon.show(ctx, stage);
     }
+}
+
+impl eframe::App for EcoView {
+    /// Fully transparent, so the raccoon's overlay window (which shares this
+    /// GL setup) shows only what it paints. The dashboard paints its own
+    /// opaque background over every pixel.
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        [0.0; 4]
+    }
+
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.frame(ctx);
+    }
+}
+
+pub(crate) fn truncate(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        s.to_string()
+    } else {
+        let t: String = s.chars().take(n.saturating_sub(1)).collect();
+        format!("{t}…")
+    }
+}
+
+pub(crate) fn native_open() -> Option<std::path::PathBuf> {
+    let script = r#"POSIX path of (choose file of type {"public.png","public.jpeg","com.microsoft.bmp","com.apple.icns","public.image"} with prompt "Choose an icon")"#;
+    let output = std::process::Command::new("osascript").args(["-e", script]).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if path.is_empty() { None } else { Some(std::path::PathBuf::from(path)) }
+}
+
+/// Applies the custom app icon, off the main thread.
+///
+/// Reading a file in a privacy-protected folder (Downloads, Desktop, ...) can
+/// wait on a macOS permission prompt; doing that on the main thread would
+/// keep the window from ever appearing.
+pub(crate) fn apply_icon(ctx: &egui::Context, settings: &Settings) {
+    let Some(path) = settings.custom_icon.clone() else { return };
+    let ctx = ctx.clone();
+    std::thread::Builder::new()
+        .name("eco-icon".into())
+        .spawn(move || {
+            let Ok(bytes) = std::fs::read(&path) else { return };
+            let Ok(img) = image::load_from_memory(&bytes) else { return };
+            let rgba = img.to_rgba8();
+            let (w, h) = rgba.dimensions();
+            let icon = egui::IconData { rgba: rgba.into_raw(), width: w, height: h };
+            ctx.send_viewport_cmd(egui::ViewportCommand::Icon(Some(Arc::new(icon))));
+            ctx.request_repaint();
+        })
+        .ok();
 }

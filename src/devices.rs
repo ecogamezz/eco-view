@@ -76,7 +76,10 @@ fn collect_ioreg(out: &mut Vec<DeviceInfo>, args: &[&str], kind: DeviceKind, key
 
 fn looks_like_controller(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
-    n.contains("controller")
+    // Plenty of internal hardware is a "controller" (the T2, USB hosts...).
+    let hardware = ["apple", "t2", "usb", "host", "hub", "bluetooth", "thunderbolt", "keyboard", "trackpad"];
+    let generic = n.contains("controller") && !hardware.iter().any(|h| n.contains(h));
+    generic
         || n.contains("gamepad")
         || n.contains("joystick")
         || n.contains("xbox")

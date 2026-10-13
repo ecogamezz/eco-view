@@ -16,7 +16,44 @@ pub fn read_gpu() -> GpuReading {
         return GpuReading::default();
     };
     let text = String::from_utf8_lossy(&output.stdout);
-    parse_ioreg(&text)
+    let mut reading = parse_ioreg(&text);
+    reading.name = reading.name.map(|n| friendly_name(&n));
+    reading
+}
+
+/// IOAccelerator often only names its driver bundle
+/// ("com.apple.kext.AMDRadeonX4000"); swap that for the PCI device's model
+/// ("Radeon Pro 555X") when one matches the vendor.
+fn friendly_name(raw: &str) -> String {
+    static MODELS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let models = MODELS.get_or_init(|| {
+        let Ok(out) = Command::new("ioreg").args(["-rd1", "-c", "IOPCIDevice", "-w0"]).output() else {
+            return Vec::new();
+        };
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| {
+                let l = l.trim();
+                let rest = l.strip_prefix("\"model\" = <\"")?;
+                Some(rest.trim_end_matches("\">").to_string())
+            })
+            .collect()
+    });
+    let lower = raw.to_lowercase();
+    let vendor = if lower.contains("amd") || lower.contains("radeon") || lower.contains("ati") {
+        "radeon"
+    } else if lower.contains("intel") {
+        "intel"
+    } else if lower.contains("nvidia") || lower.contains("geforce") {
+        "geforce"
+    } else {
+        return raw.to_string();
+    };
+    models
+        .iter()
+        .find(|m| m.to_lowercase().contains(vendor))
+        .cloned()
+        .unwrap_or_else(|| raw.trim_start_matches("com.apple.kext.").to_string())
 }
 
 fn parse_ioreg(text: &str) -> GpuReading {

@@ -165,7 +165,8 @@ fn paint_rings(painter: &egui::Painter, rect: Rect, pal: Palette, t: f32, intens
     let c = rect.center();
     for i in 0..5 {
         let r = 40.0 + i as f32 * 55.0 + (t * 0.4).sin() * 8.0;
-        let a = (28.0 * intensity) as u8;
+        // Kept faint: it sits behind every page.
+        let a = (10.0 * intensity) as u8;
         painter.circle_stroke(
             c,
             r,

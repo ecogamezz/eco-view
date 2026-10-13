@@ -10,7 +10,8 @@ use crate::audio::{self, AudioReading};
 use crate::devices::{self, DeviceInfo};
 use crate::gpu::{self, GpuReading};
 
-const HISTORY: usize = 60;
+/// Samples kept per series: 15 minutes at the default one-second refresh.
+pub const HISTORY: usize = 900;
 
 #[derive(Clone, Debug)]
 pub struct DiskInfo {
@@ -18,6 +19,9 @@ pub struct DiskInfo {
     pub mount: String,
     pub total: u64,
     pub available: u64,
+    pub file_system: String,
+    pub kind: String,
+    pub removable: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -47,7 +51,12 @@ pub struct Snapshot {
     pub os: String,
     pub kernel: String,
     pub cpu_brand: String,
+    /// e.g. "MacBookPro15,1".
+    pub model: String,
     pub cpu_cores: usize,
+    pub physical_cores: Option<usize>,
+    pub load_avg: [f64; 3],
+    pub process_count: usize,
     pub cpu_global: f32,
     pub cpu_per_core: Vec<f32>,
     pub mem_used: u64,
@@ -57,10 +66,14 @@ pub struct Snapshot {
     pub gpu: GpuReading,
     pub net_down_bps: f64,
     pub net_up_bps: f64,
+    /// Bytes moved since eco view started.
+    pub net_session_down: u64,
+    pub net_session_up: u64,
     pub disks: Vec<DiskInfo>,
     pub battery: Option<BatteryInfo>,
     pub temperature: Option<TempInfo>,
     pub uptime_secs: u64,
+    pub boot_time: u64,
     pub processes: Vec<ProcInfo>,
     pub devices: Vec<DeviceInfo>,
     pub audio: AudioReading,
@@ -73,7 +86,11 @@ impl Default for Snapshot {
             os: "macOS".into(),
             kernel: String::new(),
             cpu_brand: String::new(),
+            model: String::new(),
             cpu_cores: 0,
+            physical_cores: None,
+            load_avg: [0.0; 3],
+            process_count: 0,
             cpu_global: 0.0,
             cpu_per_core: Vec::new(),
             mem_used: 0,
@@ -83,10 +100,13 @@ impl Default for Snapshot {
             gpu: GpuReading::default(),
             net_down_bps: 0.0,
             net_up_bps: 0.0,
+            net_session_down: 0,
+            net_session_up: 0,
             disks: Vec::new(),
             battery: None,
             temperature: None,
             uptime_secs: 0,
+            boot_time: 0,
             processes: Vec::new(),
             devices: Vec::new(),
             audio: AudioReading::default(),
@@ -102,6 +122,10 @@ pub struct History {
     pub net_down: VecDeque<f32>,
     pub net_up: VecDeque<f32>,
     pub audio: VecDeque<f32>,
+    pub temp: VecDeque<f32>,
+    pub battery: VecDeque<f32>,
+    /// Number of samples ever pushed, so charts can tell old from new.
+    pub samples: u64,
 }
 
 impl History {
@@ -128,6 +152,7 @@ pub fn spawn(shared: Arc<Mutex<Metrics>>, refresh_ms: Arc<Mutex<u64>>) {
 
 fn worker(shared: Arc<Mutex<Metrics>>, refresh_ms: Arc<Mutex<u64>>) {
     let mut system = System::new_all();
+    let physical_cores = System::physical_core_count(&system);
     let mut disks = Disks::new_with_refreshed_list();
     let mut networks = Networks::new_with_refreshed_list();
     let mut components = Components::new_with_refreshed_list();
@@ -135,6 +160,13 @@ fn worker(shared: Arc<Mutex<Metrics>>, refresh_ms: Arc<Mutex<u64>>) {
     let mut last_net = Instant::now();
     let mut last_rx: u64 = networks.values().map(|n| n.total_received()).sum();
     let mut last_tx: u64 = networks.values().map(|n| n.total_transmitted()).sum();
+    let (start_rx, start_tx) = (last_rx, last_tx);
+    let model = std::process::Command::new("sysctl")
+        .args(["-n", "hw.model"])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
     // `Instant - Duration` panics on underflow; uptime may be shorter than 30s.
     let mut last_devices = Instant::now()
         .checked_sub(Duration::from_secs(30))
@@ -152,7 +184,10 @@ fn worker(shared: Arc<Mutex<Metrics>>, refresh_ms: Arc<Mutex<u64>>) {
         system.refresh_processes_specifics(
             ProcessesToUpdate::All,
             true,
-            ProcessRefreshKind::everything(),
+            // Only what the UI shows: refreshing everything (environment, command
+            // lines, disk I/O, users) for hundreds of processes every second was
+            // the single biggest CPU cost in the app.
+            ProcessRefreshKind::nothing().with_cpu().with_memory(),
         );
 
         if tick.is_multiple_of(2) {
@@ -207,7 +242,8 @@ fn worker(shared: Arc<Mutex<Metrics>>, refresh_ms: Arc<Mutex<u64>>) {
             .filter(|p| !p.name.is_empty())
             .collect();
         processes.sort_by(|a, b| b.cpu.partial_cmp(&a.cpu).unwrap_or(std::cmp::Ordering::Equal));
-        processes.truncate(24);
+        let process_count = processes.len();
+        processes.truncate(400);
 
         let disk_info: Vec<DiskInfo> = disks
             .iter()
@@ -217,6 +253,13 @@ fn worker(shared: Arc<Mutex<Metrics>>, refresh_ms: Arc<Mutex<u64>>) {
                 mount: d.mount_point().to_string_lossy().into_owned(),
                 total: d.total_space(),
                 available: d.available_space(),
+                file_system: d.file_system().to_string_lossy().into_owned(),
+                kind: match d.kind() {
+                    sysinfo::DiskKind::SSD => "SSD".into(),
+                    sysinfo::DiskKind::HDD => "HDD".into(),
+                    _ => "Disk".into(),
+                },
+                removable: d.is_removable(),
             })
             .collect();
 
@@ -227,7 +270,14 @@ fn worker(shared: Arc<Mutex<Metrics>>, refresh_ms: Arc<Mutex<u64>>) {
                 .unwrap_or_else(|| "macOS".into()),
             kernel: System::kernel_version().unwrap_or_default(),
             cpu_brand,
+            model: model.clone(),
             cpu_cores: cpus.len(),
+            physical_cores,
+            load_avg: {
+                let l = System::load_average();
+                [l.one, l.five, l.fifteen]
+            },
+            process_count,
             cpu_global,
             cpu_per_core,
             mem_used: system.used_memory(),
@@ -237,10 +287,13 @@ fn worker(shared: Arc<Mutex<Metrics>>, refresh_ms: Arc<Mutex<u64>>) {
             gpu,
             net_down_bps: net_down,
             net_up_bps: net_up,
+            net_session_down: rx.saturating_sub(start_rx),
+            net_session_up: tx.saturating_sub(start_tx),
             disks: disk_info,
             battery,
             temperature,
             uptime_secs: System::uptime(),
+            boot_time: System::boot_time(),
             processes,
             devices: devices.clone(),
             audio,
@@ -260,6 +313,11 @@ fn worker(shared: Arc<Mutex<Metrics>>, refresh_ms: Arc<Mutex<u64>>) {
                 &mut guard.history.audio,
                 snap.audio.volume.unwrap_or(0.0) * 100.0,
             );
+            let temp = snap.temperature.as_ref().map(|t| t.celsius).unwrap_or(0.0);
+            History::push(&mut guard.history.temp, temp);
+            let bat = snap.battery.as_ref().map(|b| b.percent).unwrap_or(0.0);
+            History::push(&mut guard.history.battery, bat);
+            guard.history.samples += 1;
             guard.snap = snap;
         }
     }
@@ -330,7 +388,9 @@ fn read_battery() -> Option<BatteryInfo> {
             charging = words.any(|w| w == "charging" || w == "charged");
             // "60%; discharging; 0:54 remaining present: true" -> "0:54"
             if let Some((_, rest)) = line.split_once(';')
-                && let Some(time) = rest.split_whitespace().find(|w| w.contains(':')) {
+                && let Some(time) = rest
+                    .split_whitespace()
+                    .find(|w| w.contains(':') && w.starts_with(|c: char| c.is_ascii_digit())) {
                     remaining = Some(time.trim_end_matches(':').to_string());
                 }
         }

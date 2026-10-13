@@ -1,4 +1,5 @@
 mod app;
+mod charts;
 mod audio;
 mod autostart;
 mod devices;
@@ -9,12 +10,15 @@ mod grid;
 mod icons;
 mod metrics;
 mod notifications;
+mod pages;
 mod particles;
 mod raccoon;
 mod settings;
+mod shell;
+mod snapshot;
 mod sound;
 mod theme;
-mod ui;
+mod widgets;
 
 use eframe::egui::{IconData, ViewportBuilder};
 
@@ -32,6 +36,17 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
 
+    if let Some(i) = args.iter().position(|a| a == "--screenshot") {
+        match snapshot::run(&args[i + 1..]) {
+            Ok(out) => println!("wrote {out}"),
+            Err(e) => {
+                eprintln!("screenshot failed: {e}");
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
+
     let icon = default_icon();
     let mut viewport = ViewportBuilder::default()
         // The raccoon's overlay shares this window's OpenGL configuration,
@@ -39,8 +54,13 @@ fn main() -> eframe::Result<()> {
         // *root* window asks for transparency. The dashboard still paints an
         // opaque background everywhere.
         .with_transparent(true)
-        .with_inner_size([1280.0, 820.0])
-        .with_min_inner_size([960.0, 640.0])
+        .with_inner_size([1360.0, 860.0])
+        .with_min_inner_size([980.0, 660.0])
+        // Content runs under a transparent title bar; the sidebar leaves room
+        // for the traffic lights and acts as the drag handle.
+        .with_fullsize_content_view(true)
+        .with_titlebar_shown(false)
+        .with_title_shown(false)
         .with_title("eco view")
         .with_app_id("com.ecoview.monitor");
     if let Some(icon) = icon {
